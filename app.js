@@ -361,7 +361,7 @@ function nodeInfo() {
   if (cfg.backend === 'livekit') {
     return { name: (e && e.edition) || 'LiveKit', region: (e && e.region) || '', node: (e && e.nodeId) || '', version: (e && e.serverVersion) || '' };
   }
-  return { name: 'Agora SD-RTN', region: cfg.agoraArea || '自動選擇', node: '', version: '' };
+  return { name: 'Agora SD-RTN', region: cfg.agoraArea ? `指定 ${cfg.agoraArea}` : 'SDK 不提供（自動分配）', node: '', version: '' };
 }
 function mainPath(list) {
   if (!list || !list.length) return null;
@@ -373,7 +373,7 @@ function ownPath() {
   return { t: 'path', role: cfg.role, device: cfg.device || '', scenario: cfg.scenario, ctype: p.ctype || '', proto: p.proto || '', relay: p.relay || '',
     rtt: p.rtt == null ? null : p.rtt, pcs: (S.paths || []).length, raddr: p.raddr || '', rport: p.rport || null, region: n.region, node: n.node };
 }
-const CTYPE_LABEL = { host: '直連（同網段）', srflx: '經 NAT 直連', prflx: '經 NAT 直連', relay: 'TURN 中繼' };
+const CTYPE_LABEL = { host: '直連（裝置自身位址，無 NAT）', srflx: '經 NAT 直連', prflx: '經 NAT 直連', relay: 'TURN 中繼' };
 function legText(p) {
   if (!p || !p.ctype) return ['等待連線資料…', ''];
   const proto = p.relay ? `TURN/${p.relay.toUpperCase()}` : (p.proto || '').toUpperCase();
@@ -472,6 +472,10 @@ function renderPath() {
   box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="通話路徑圖">${h}</svg>`;
 
   const pcs = S.paths || [];
+  const ips = [...new Set([own && own.raddr, peer && peer.raddr].filter(Boolean))];
+  $('pathLookup').innerHTML = joined && ips.length
+    ? '查媒體節點的實際位置：' + ips.map(ip => `<a href="https://ipinfo.io/${encodeURIComponent(ip)}" target="_blank" rel="noopener noreferrer">${escapeHtml(ip)}</a>`).join('、')
+    : '';
   $('pathNote').textContent = joined
     ? `本機建立 ${pcs.length} 條 WebRTC 連線（${pcs.map(p => p.send && p.recv ? '收發' : p.send ? '送出' : p.recv ? '接收' : '待命').join('、') || '-'}）。接聽、掛斷等訊息走媒體伺服器的資料通道轉送。` +
       (split ? '雙方連到不同節點，中間那段由服務商內部轉送。' : '')
