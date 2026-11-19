@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call Meter Report</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f7f9; --surface-1: #fcfcfb; --line: #dfe2e6; --grid: #e9ebee;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #6b6a66;
+  --series-1: #2a78d6; --accent: #2563eb; --accent-text: #fff;
+  --good: #006300; --critical: #b42323; --chip: #eef0f3;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --bg: #111110; --surface-1: #1a1a19; --line: #2f2f2c; --grid: #262624;
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9c9b93;
+    --series-1: #3987e5; --accent: #3b82f6; --accent-text: #fff;
+    --good: #4cc24c; --critical: #e66767; --chip: #262624;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111110; --surface-1: #1a1a19; --line: #2f2f2c; --grid: #262624;
+  --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9c9b93;
+  --series-1: #3987e5; --accent: #3b82f6; --accent-text: #fff;
+  --good: #4cc24c; --critical: #e66767; --chip: #262624;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; background: var(--bg); color: var(--text-primary);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", "PingFang TC", sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px 16px 64px; }
+h1 { font-size: 20px; margin: 4px 0 2px; }
+h2 { font-size: 16px; margin: 0 0 4px; }
+.sub { color: var(--text-secondary); margin: 0 0 8px; font-size: 13px; }
+.card { background: var(--surface-1); border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-top: 14px; }
+.drop { border: 2px dashed var(--line); border-radius: 12px; padding: 18px; text-align: center; color: var(--text-secondary); }
+.drop.over { border-color: var(--accent); }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+button, select { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 12px; min-height: 40px; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+label.inline { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text-secondary); }
+.chip { background: var(--chip); border-radius: 999px; padding: 2px 10px; font-size: 13px; color: var(--text-secondary); }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; white-space: nowrap; vertical-align: top; }
+th { color: var(--text-secondary); font-weight: 600; position: sticky; top: 0; background: var(--surface-1); }
+td.num { font-family: var(--mono); text-align: right; }
+td.wrap { white-space: normal; min-width: 220px; }
+.good { color: var(--good); } .bad { color: var(--critical); }
+.note { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+#chart { width: 100%; position: relative; }
+#chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+#tip { position: absolute; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.15);
+  white-space: nowrap; display: none; z-index: 2; }
+.empty { color: var(--text-muted); padding: 12px 0; }
+@media print { .noprint { display: none !important; } body { background: #fff; } .card { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Call Meter 報表</h1>
+  <p class="sub">把各支手機匯出的 JSON／CSV 拖進來，自動合併、分組比較。檔案只在這個瀏覽器裡處理，不會上傳。</p>
+
+  <section class="card noprint">
+    <div class="drop" id="drop">
+      把檔案拖到這裡，或
+      <label style="display:inline"><input type="file" id="file" multiple accept=".json,.csv,application/json,text/csv" style="display:none"><button type="button" class="primary" onclick="document.getElementById('file').click()">選擇檔案</button></label>
+      <div class="note">可以一次選多個檔案。支援 Call Meter 匯出的 JSON、CSV，以及 Letstalk 人工紀錄 CSV（<a href="#" id="tplLink">下載範本</a>）。</div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="chip" id="loadedInfo">尚未載入</span>
+      <label class="inline">角色
+        <select id="fRole"><option value="callee">被叫（主要指標）</option><option value="caller">主叫（估計值）</option><option value="all">全部</option></select>
+      </label>
+      <label class="inline">情境 <select id="fScenario"><option value="">全部</option></select></label>
+      <label class="inline">裝置 <select id="fDevice"><option value="">全部</option></select></label>
+      <label class="inline">聲音來源 <select id="fSource"><option value="">全部</option></select></label>
+      <button id="btnClear">清空</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>模式 A（接聽後加入）vs 模式 B（響鈴時預先加入）</h2>
+    <p class="sub">同後端、同設定、同情境下，比較「按下接聽 → 聽到聲音」。成功率是結果為 ok 的比例。</p>
+    <div class="table-wrap"><table id="abTable"></table></div>
+  </section>
+
+  <section class="card">
+    <h2>接聽 → 聽到聲音的分布</h2>
+    <p class="sub">每個點是一通成功的通話；深色實線是中位數，虛線是 P90。橫軸是對數刻度。右側列出沒出聲或加入失敗的通數。</p>
+    <div id="chart"><div id="tip"></div></div>
+  </section>
+
+  <section class="card">
+    <h2>各組完整指標</h2>
+    <div class="table-wrap"><table id="groupTable"></table></div>
+    <p class="note">掉包、抖動、RTT、延遲只算「已聽到聲音之後」的秒數，再對每通取平均。斷音只在聲音來源為測試音時有意義。UDP 比例只算有拿到傳輸資訊的通話。</p>
+  </section>
+
+  <section class="card">
+    <h2>失敗與異常通話</h2>
+    <p class="sub">結果不是 ok，或有斷音、重連的通話。可用來找出失敗發生在哪個階段。</p>
+    <div class="table-wrap"><table id="failTable"></table></div>
+  </section>
+
+  <section class="card noprint">
+    <div class="row">
+      <button id="btnCsv">下載合併後 CSV</button>
+      <button id="btnMd">複製 Markdown 摘要</button>
+      <button onclick="window.print()">列印／存成 PDF</button>
+      <span class="chip" id="copyMsg" hidden>已複製</span>
+    </div>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let ALL = [];   // merged records, deduped by id
+
+// ---------- parsing ----------
+const NUMERIC = new Set(['cycle', 'acceptToFirstAudioMs', 'joinMs', 'publishMs', 'ringToJoinedMs', 'acceptToJoinedMs',
+  'acceptToRemoteTrackMs', 'talkSeconds', 'avgLossPct', 'maxLossPct', 'avgJitterMs', 'avgRttMs', 'maxRttMs', 'avgE2eMs',
+  'avgKbps', 'gapCount', 'gapTotalMs', 'longestGapMs', 'reconnects', 'worstDownQuality']);
+
+function parseCsv(text) {
+  text = text.replace(/^﻿/, '');
+  const rows = [];
+  let row = [], field = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
+      else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.some(x => x !== '')) rows.push(row);
+      row = [];
+    } else field += c;
+  }
+  row.push(field);
+  if (row.some(x => x !== '')) rows.push(row);
+  if (!rows.length) return [];
+  const head = rows[0].map(h => h.trim());
+  return rows.slice(1).map(r => Object.fromEntries(head.map((h, i) => [h, r[i] == null ? '' : r[i]])));
+}
+
+function normalize(r) {
+  const o = Object.assign({}, r);
+  for (const k of NUMERIC) {
+    if (o[k] === '' || o[k] == null) o[k] = null;
+    else if (typeof o[k] !== 'number') { const n = Number(o[k]); o[k] = isNaN(n) ? null : n; }
+  }
+  if (o.acceptEstimated === 'true') o.acceptEstimated = true;
+  if (o.acceptEstimated === 'false') o.acceptEstimated = false;
+  return o;
+}
+
+function fromLetstalkManual(r, i, fileName) {
+  let ms = r.acceptToFirstAudioMs !== undefined && r.acceptToFirstAudioMs !== '' ? Number(r.acceptToFirstAudioMs) : null;
+  if (ms == null && r.acceptToFirstAudioSec !== undefined && r.acceptToFirstAudioSec !== '') ms = Number(r.acceptToFirstAudioSec) * 1000;
+  const result = (r.result || '').trim() || (ms != null ? 'ok' : 'no_audio');
+  return normalize({
+    id: 'manual-' + fileName + '-' + i + '-' + (r.startedAt || ''), startedAt: r.startedAt || '', role: 'callee',
+    backend: 'letstalk', sdk: 'Letstalk App（人工記錄）', joinMode: 'app', audioSource: 'voice', area: '', proxy: '',
+    scenario: r.scenario || '', device: r.device || '', note: r.note || '',
+    result, acceptToFirstAudioMs: result === 'ok' ? ms : null, error: result === 'ok' ? '' : (r.note || ''),
+  });
+}
+
+async function readFile(f) {
+  const text = await f.text();
+  if (/\.json$/i.test(f.name) || text.trim().startsWith('{') || text.trim().startsWith('[')) {
+    const j = JSON.parse(text);
+    const list = Array.isArray(j) ? j : (j.records || []);
+    return list.map(normalize);
+  }
+  const rows = parseCsv(text);
+  if (rows.length && !('backend' in rows[0]) && ('acceptToFirstAudioSec' in rows[0] || 'acceptToFirstAudioMs' in rows[0])) {
+    return rows.map((r, i) => fromLetstalkManual(r, i, f.name));
+  }
+  return rows.map(normalize);
+}
+
+async function addFiles(files) {
+  const errs = [];
+  const byId = new Map(ALL.map(r => [r.id, r]));
+  for (const f of files) {
+    try {
+      const recs = await readFile(f);
+      for (const r of recs) {
+        if (!r.id) r.id = 'noid-' + Math.random().toString(36).slice(2);
+        const prev = byId.get(r.id);
+        // Prefer the JSON copy (has samples/events) over a CSV copy of the same record.
+        if (!prev || (!prev.events && r.events)) byId.set(r.id, r);
+      }
+    } catch (e) { errs.push(f.name + '：' + e.message); }
+  }
+  ALL = [...byId.values()];
+  $('loadedInfo').textContent = `已載入 ${ALL.length} 筆` + (errs.length ? `（${errs.length} 個檔案失敗：${errs.join('；')}）` : '');
+  fillFilters();
+  render();
+}
+
+// ---------- stats ----------
+const avg = a => a.length ? a.reduce((s, x) => s + x, 0) / a.length : null;
+function q(a, p) { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p / 100 * s.length))]; }
+const med = a => q(a, 50);
+const num = v => typeof v === 'number' && !isNaN(v);
+const fmtMs = v => v == null ? '–' : (v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 0 : 1) + ' s' : Math.round(v) + ' ms');
+const fmtPct = v => v == null ? '–' : (v * 100).toFixed(0) + '%';
+const fmt1 = (v, unit = '') => v == null ? '–' : v.toFixed(1) + unit;
+const fmt0 = (v, unit = '') => v == null ? '–' : Math.round(v) + unit;
+
+const MODE_LABEL = { 'after-accept': 'A 接聽後加入', 'pre-join': 'B 預先加入', app: '（App）' };
+function settingKey(r) {
+  if (r.backend === 'letstalk') return 'Letstalk App（人工）';
+  const extra = r.backend === 'agora' ? ` · 區域 ${r.area || 'default'}${r.proxy && r.proxy !== '0' ? ' · 雲代理 ' + r.proxy : ''}` : '';
+  return `${r.sdk || r.backend}${extra}`;
+}
+function groupKey(r) { return `${settingKey(r)} | ${MODE_LABEL[r.joinMode] || r.joinMode || ''} | ${r.scenario || '未標情境'}`; }
+
+function stats(list) {
+  const ok = list.filter(r => r.result === 'ok');
+  const a2a = ok.map(r => r.acceptToFirstAudioMs).filter(num);
+  const talk = ok.reduce((s, r) => s + (r.talkSeconds || 0), 0);
+  const gaps = ok.reduce((s, r) => s + (r.gapCount || 0), 0);
+  const withProto = ok.filter(r => r.protocol);
+  const recov = ok.flatMap(r => String(r.recoveryMs || '').split('|').filter(Boolean).map(Number)).filter(num);
+  const pick = k => ok.map(r => r[k]).filter(num);
+  return {
+    n: list.length, ok: ok.length, okRate: list.length ? ok.length / list.length : null,
+    noAudio: list.filter(r => r.result === 'no_audio').length,
+    joinFailed: list.filter(r => r.result === 'join_failed').length,
+    otherFail: list.filter(r => !['ok', 'no_audio', 'join_failed'].includes(r.result)).length,
+    a2a, a2aMed: med(a2a), a2aP90: q(a2a, 90), a2aMax: a2a.length ? Math.max(...a2a) : null,
+    joinMed: med(list.map(r => r.joinMs).filter(num)),
+    loss: avg(pick('avgLossPct')), lossP90: q(pick('avgLossPct'), 90), jitter: avg(pick('avgJitterMs')),
+    rtt: avg(pick('avgRttMs')), e2e: avg(pick('avgE2eMs')),
+    gapsPerMin: talk > 0 ? gaps / (talk / 60) : null, gapTotal: avg(pick('gapTotalMs')),
+    reconnects: list.reduce((s, r) => s + (r.reconnects || 0), 0), recovMed: med(recov),
+    udpShare: withProto.length ? withProto.filter(r => /udp/.test(r.protocol) && !/tcp/.test(r.protocol)).length / withProto.length : null,
+    relayShare: withProto.length ? ok.filter(r => /relay/.test(r.candidateType || '')).length / withProto.length : null,
+  };
+}
+
+function filtered() {
+  const role = $('fRole').value, sc = $('fScenario').value, dev = $('fDevice').value, src = $('fSource').value;
+  return ALL.filter(r => (role === 'all' || r.role === role) && (!sc || r.scenario === sc) && (!dev || r.device === dev) && (!src || r.audioSource === src));
+}
+function groups(list) {
+  const m = new Map();
+  for (const r of list) { const k = groupKey(r); if (!m.has(k)) m.set(k, []); m.get(k).push(r); }
+  return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh-Hant'));
+}
+
+// ---------- rendering ----------
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function fillFilters() {
+  const keep = id => $(id).value;
+  const opts = (id, vals) => {
+    const cur = keep(id);
+    $(id).innerHTML = '<option value="">全部</option>' + vals.map(v => `<option${v === cur ? ' selected' : ''}>${esc(v)}</option>`).join('');
+  };
+  opts('fScenario', [...new Set(ALL.map(r => r.scenario).filter(Boolean))].sort());
+  opts('fDevice', [...new Set(ALL.map(r => r.device).filter(Boolean))].sort());
+  opts('fSource', [...new Set(ALL.map(r => r.audioSource).filter(Boolean))].sort());
+}
+
+function abRows(list) {
+  const m = new Map();
+  for (const r of list) {
+    if (r.backend === 'letstalk') continue;
+    const k = `${settingKey(r)} | ${r.scenario || '未標情境'}`;
+    if (!m.has(k)) m.set(k, { A: [], B: [] });
+    if (r.joinMode === 'after-accept') m.get(k).A.push(r);
+    else if (r.joinMode === 'pre-join') m.get(k).B.push(r);
+  }
+  const lt = new Map();
+  for (const r of list.filter(r => r.backend === 'letstalk')) {
+    const k = r.scenario || '未標情境';
+    if (!lt.has(k)) lt.set(k, []);
+    lt.get(k).push(r);
+  }
+  return [...m.entries()].map(([k, v]) => {
+    const sa = stats(v.A), sb = stats(v.B);
+    const scen = k.split(' | ')[1];
+    const sl = lt.has(scen) ? stats(lt.get(scen)) : null;
+    return { k, sa, sb, sl, saved: sa.a2aMed != null && sb.a2aMed != null ? sa.a2aMed - sb.a2aMed : null };
+  }).sort((a, b) => a.k.localeCompare(b.k, 'zh-Hant'));
+}
+
+function renderAB(list) {
+  const rows = abRows(list);
+  const head = '<tr><th>後端與設定 | 情境</th><th>A 筆數</th><th>A 成功率</th><th>A 中位</th><th>A P90</th><th>B 筆數</th><th>B 成功率</th><th>B 中位</th><th>B P90</th><th>B 比 A 省</th><th>同情境 Letstalk 中位／成功率</th></tr>';
+  const rateCls = v => v == null ? '' : (v >= 0.95 ? 'good' : v < 0.85 ? 'bad' : '');
+  const body = rows.map(({ k, sa, sb, sl, saved }) => `<tr><td>${esc(k)}</td>` +
+    `<td class="num">${sa.n}</td><td class="num ${rateCls(sa.okRate)}">${fmtPct(sa.okRate)}</td><td class="num">${fmtMs(sa.a2aMed)}</td><td class="num">${fmtMs(sa.a2aP90)}</td>` +
+    `<td class="num">${sb.n}</td><td class="num ${rateCls(sb.okRate)}">${fmtPct(sb.okRate)}</td><td class="num">${fmtMs(sb.a2aMed)}</td><td class="num">${fmtMs(sb.a2aP90)}</td>` +
+    `<td class="num">${saved == null ? '–' : fmtMs(saved)}</td>` +
+    `<td class="num">${sl ? fmtMs(sl.a2aMed) + '／' + fmtPct(sl.okRate) + `（${sl.n}）` : '–'}</td></tr>`).join('');
+  $('abTable').innerHTML = rows.length ? head + body : '<tr><td class="empty">還沒有同時含 A、B 模式的資料。</td></tr>';
+  return rows;
+}
+
+function renderGroups(gs) {
+  const head = '<tr><th>後端與設定 | 模式 | 情境</th><th>筆數</th><th>成功率</th><th>沒出聲</th><th>加入失敗</th><th>其他</th>' +
+    '<th>接聽→出聲 中位</th><th>P90</th><th>最大</th><th>加入耗時 中位</th><th>掉包 平均</th><th>掉包 P90</th><th>抖動</th><th>RTT</th>' +
+    '<th>端到端延遲</th><th>斷音／分鐘</th><th>斷音總長 平均</th><th>重連</th><th>恢復 中位</th><th>UDP 比例</th><th>中繼比例</th></tr>';
+  const body = gs.map(([k, list]) => {
+    const s = stats(list);
+    return `<tr><td>${esc(k)}</td><td class="num">${s.n}</td><td class="num">${fmtPct(s.okRate)}</td><td class="num">${s.noAudio}</td><td class="num">${s.joinFailed}</td><td class="num">${s.otherFail}</td>` +
+      `<td class="num">${fmtMs(s.a2aMed)}</td><td class="num">${fmtMs(s.a2aP90)}</td><td class="num">${fmtMs(s.a2aMax)}</td><td class="num">${fmtMs(s.joinMed)}</td>` +
+      `<td class="num">${fmt1(s.loss, '%')}</td><td class="num">${fmt1(s.lossP90, '%')}</td><td class="num">${fmt0(s.jitter, ' ms')}</td><td class="num">${fmt0(s.rtt, ' ms')}</td>` +
+      `<td class="num">${fmt0(s.e2e, ' ms')}</td><td class="num">${fmt1(s.gapsPerMin)}</td><td class="num">${fmtMs(s.gapTotal)}</td><td class="num">${s.reconnects}</td>` +
+      `<td class="num">${fmtMs(s.recovMed)}</td><td class="num">${fmtPct(s.udpShare)}</td><td class="num">${fmtPct(s.relayShare)}</td></tr>`;
+  }).join('');
+  $('groupTable').innerHTML = gs.length ? head + body : '<tr><td class="empty">沒有符合篩選條件的資料。</td></tr>';
+}
+
+function renderFailures(list) {
+  const bad = list.filter(r => r.result !== 'ok' || (r.gapCount || 0) > 0 || (r.reconnects || 0) > 0)
+    .sort((a, b) => String(a.startedAt).localeCompare(String(b.startedAt)));
+  const head = '<tr><th>時間</th><th>裝置</th><th>組別</th><th>結果</th><th>接聽→加入</th><th>斷音</th><th>重連</th><th class="wrap">連線狀態</th><th class="wrap">錯誤／最後事件</th></tr>';
+  const body = bad.slice(0, 300).map(r => {
+    const lastEvents = Array.isArray(r.events) ? r.events.slice(-4).map(e => `${(e.t / 1000).toFixed(1)}s ${e.name} ${e.detail || ''}`).join('；') : '';
+    const t = r.startedAt ? new Date(r.startedAt).toLocaleString('zh-TW', { hour12: false }) : '';
+    return `<tr><td>${esc(t)}</td><td>${esc(r.device)}</td><td>${esc(groupKey(r))}</td>` +
+      `<td class="${r.result === 'ok' ? '' : 'bad'}">${esc(r.result)}</td><td class="num">${fmtMs(r.acceptToJoinedMs)}</td>` +
+      `<td class="num">${r.gapCount || 0}／${fmtMs(r.gapTotalMs)}</td><td class="num">${r.reconnects || 0}</td>` +
+      `<td class="wrap">${esc(r.connTrail || '')}</td><td class="wrap">${esc([r.error, lastEvents].filter(Boolean).join('；'))}</td></tr>`;
+  }).join('');
+  $('failTable').innerHTML = bad.length ? head + body : '<tr><td class="empty">沒有失敗或異常的通話。</td></tr>';
+}
+
+// Strip plot: one row per group, log-scale x, dots = successful calls, solid tick = median, dashed tick = P90.
+function renderChart(gs) {
+  const box = $('chart');
+  const tip = $('tip');
+  box.querySelectorAll('svg, .empty').forEach(n => n.remove());
+  const rows = gs.map(([k, list]) => ({ k, list, s: stats(list) })).filter(r => r.s.n > 0);
+  if (!rows.length) { box.insertAdjacentHTML('beforeend', '<div class="empty">沒有資料。</div>'); return; }
+  const W = Math.max(320, box.clientWidth);
+  const narrow = W < 640;
+  const padL = 12, padR = 24, labelH = 18, band = 26, gapY = 10, axisH = 26;
+  const plotW = W - padL - padR;
+  const all = rows.flatMap(r => r.s.a2a).filter(v => v > 0);
+  const lo = Math.min(10, ...all), hi = Math.max(30000, ...all);
+  const lx = v => padL + (Math.log10(Math.max(lo, v)) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo)) * plotW;
+  const rowH = labelH + band + (narrow ? 16 : 0) + gapY;
+  const H = rows.length * rowH + axisH + 4;
+  const ticks = (narrow ? [10, 100, 1000, 10000] : [10, 30, 100, 300, 1000, 3000, 10000, 30000, 60000]).filter(t => t >= lo && t <= hi);
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', '各組接聽到聽到聲音的時間分布');
+  let html = '';
+  for (const t of ticks) {
+    const x = lx(t);
+    html += `<line x1="${x}" x2="${x}" y1="0" y2="${H - axisH}" stroke="var(--grid)" stroke-width="1"/>`;
+    html += `<text x="${x}" y="${H - axisH + 16}" font-size="11" text-anchor="middle" fill="var(--text-muted)">${fmtMs(t)}</text>`;
+  }
+  rows.forEach((r, i) => {
+    const y0 = i * rowH;
+    const cy = y0 + labelH + band / 2;
+    html += `<text x="${padL}" y="${y0 + 13}" font-size="12" fill="var(--text-secondary)">${esc(r.k)}（${r.s.n} 通）</text>`;
+    html += `<line x1="${padL}" x2="${padL + plotW}" y1="${cy}" y2="${cy}" stroke="var(--line)" stroke-width="1"/>`;
+    r.list.filter(x => x.result === 'ok' && num(x.acceptToFirstAudioMs)).forEach((x, j) => {
+      let h = 0; for (const c of String(x.id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+      const jy = ((h % 1000) / 1000 - 0.5) * (band - 10);
+      const px = lx(x.acceptToFirstAudioMs);
+      const info = `${esc(x.device || '')} ${esc(x.startedAt ? new Date(x.startedAt).toLocaleTimeString('zh-TW', { hour12: false }) : '')}｜${fmtMs(x.acceptToFirstAudioMs)}`;
+      html += `<circle cx="${px}" cy="${cy + jy}" r="4" fill="var(--series-1)" fill-opacity=".7" stroke="var(--surface-1)" stroke-width="1.5"/>`;
+      html += `<circle cx="${px}" cy="${cy + jy}" r="9" fill="transparent" data-tip="${info}"/>`;
+    });
+    if (r.s.a2aMed != null) {
+      const mx = lx(r.s.a2aMed);
+      html += `<line x1="${mx}" x2="${mx}" y1="${cy - band / 2}" y2="${cy + band / 2}" stroke="var(--text-primary)" stroke-width="2" stroke-linecap="round"/>`;
+    }
+    if (r.s.a2aP90 != null) {
+      const px = lx(r.s.a2aP90);
+      html += `<line x1="${px}" x2="${px}" y1="${cy - band / 2 + 3}" y2="${cy + band / 2 - 3}" stroke="var(--text-secondary)" stroke-width="2" stroke-dasharray="3 3"/>`;
+    }
+    const fails = r.s.n - r.s.ok;
+    const sum = `中位 ${fmtMs(r.s.a2aMed)}・P90 ${fmtMs(r.s.a2aP90)}${fails ? `・失敗 ${fails}` : ''}`;
+    if (narrow) html += `<text x="${padL}" y="${y0 + labelH + band + 12}" font-size="11" fill="var(--text-secondary)">${sum}</text>`;
+    else html += `<text x="${padL + plotW}" y="${y0 + 13}" font-size="12" text-anchor="end" fill="var(--text-primary)">${sum}</text>`;
+  });
+  svg.innerHTML = html;
+  box.appendChild(svg);
+  svg.addEventListener('pointermove', e => {
+    const t = e.target.getAttribute && e.target.getAttribute('data-tip');
+    if (!t) { tip.style.display = 'none'; return; }
+    tip.textContent = t;
+    tip.style.display = 'block';
+    const br = box.getBoundingClientRect();
+    let x = e.clientX - br.left + 12;
+    if (x + tip.offsetWidth > br.width) x = e.clientX - br.left - tip.offsetWidth - 12;
+    tip.style.left = Math.max(0, x) + 'px';
+    tip.style.top = (e.clientY - br.top - 34) + 'px';
+  });
+  svg.addEventListener('pointerleave', () => { tip.style.display = 'none'; });
+}
+
+let lastAB = [], lastGroups = [];
+function render() {
+  const list = filtered();
+  const gs = groups(list);
+  lastAB = renderAB(list);
+  lastGroups = gs;
+  renderChart(gs);
+  renderGroups(gs);
+  renderFailures(list);
+}
+
+// ---------- export ----------
+function download(name, text, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+}
+function mergedCsv() {
+  const skip = new Set(['milestones', 'gaps', 'samples', 'events']);
+  const cols = [...new Set(ALL.flatMap(r => Object.keys(r)))].filter(k => !skip.has(k));
+  const e = v => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  return '﻿' + [cols.join(',')].concat(ALL.map(r => cols.map(c => e(r[c])).join(','))).join('\n');
+}
+function markdown() {
+  const role = $('fRole').selectedOptions[0].textContent;
+  let md = `## Call Meter 結果摘要\n\n資料：${filtered().length} 筆（角色：${role}${$('fScenario').value ? '，情境：' + $('fScenario').value : ''}）\n\n`;
+  md += '### 模式 A vs B：接聽 → 聽到聲音\n\n| 後端與設定 | 情境 | A 筆數 | A 成功率 | A 中位 | A P90 | B 筆數 | B 成功率 | B 中位 | B P90 | B 比 A 省 | Letstalk 中位／成功率 |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n';
+  for (const { k, sa, sb, sl, saved } of lastAB) {
+    const [setting, scen] = k.split(' | ');
+    md += `| ${setting} | ${scen} | ${sa.n} | ${fmtPct(sa.okRate)} | ${fmtMs(sa.a2aMed)} | ${fmtMs(sa.a2aP90)} | ${sb.n} | ${fmtPct(sb.okRate)} | ${fmtMs(sb.a2aMed)} | ${fmtMs(sb.a2aP90)} | ${saved == null ? '–' : fmtMs(saved)} | ${sl ? fmtMs(sl.a2aMed) + '／' + fmtPct(sl.okRate) : '–'} |\n`;
+  }
+  md += '\n### 各組指標\n\n| 組別 | 筆數 | 成功率 | 沒出聲 | 加入失敗 | 接聽→出聲 中位 | P90 | 掉包 | RTT | 斷音／分 | UDP 比例 |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n';
+  for (const [k, list] of lastGroups) {
+    const s = stats(list);
+    md += `| ${k.replace(/\|/g, '/')} | ${s.n} | ${fmtPct(s.okRate)} | ${s.noAudio} | ${s.joinFailed} | ${fmtMs(s.a2aMed)} | ${fmtMs(s.a2aP90)} | ${fmt1(s.loss, '%')} | ${fmt0(s.rtt, ' ms')} | ${fmt1(s.gapsPerMin)} | ${fmtPct(s.udpShare)} |\n`;
+  }
+  return md;
+}
+const TEMPLATE = '﻿startedAt,scenario,device,acceptToFirstAudioSec,result,note\n2026-11-20T14:05:00+08:00,中華 4G,B-iPhone13,2.4,ok,定點\n2026-11-20T14:07:30+08:00,中華 4G,B-iPhone13,,no_audio,接起來沒聲音 15 秒後自己掛斷\n';
+
+// ---------- wiring ----------
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
+$('file').addEventListener('change', e => { addFiles([...e.target.files]); e.target.value = ''; });
+['fRole', 'fScenario', 'fDevice', 'fSource'].forEach(id => $(id).addEventListener('change', render));
+$('btnClear').onclick = () => { ALL = []; $('loadedInfo').textContent = '尚未載入'; fillFilters(); render(); };
+$('btnCsv').onclick = () => { if (ALL.length) download('callmeter_merged.csv', mergedCsv(), 'text/csv'); };
+$('btnMd').onclick = async () => {
+  const md = markdown();
+  try { await navigator.clipboard.writeText(md); $('copyMsg').hidden = false; setTimeout(() => { $('copyMsg').hidden = true; }, 2000); }
+  catch (e) { download('callmeter_summary.md', md, 'text/markdown'); }
+};
+$('tplLink').onclick = e => { e.preventDefault(); download('letstalk_manual_template.csv', TEMPLATE, 'text/csv'); };
+let rt;
+window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => renderChart(lastGroups), 150); });
+render();
+</script>
+</body>
+</html>

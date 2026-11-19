@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Call Meter</title>
+<script>
+// Must run before any RTC SDK loads: collect every RTCPeerConnection so we can read
+// transport-level stats (UDP/TCP, candidate type, loss, jitter, RTT) for both backends.
+(function () {
+  var Orig = window.RTCPeerConnection;
+  window.__pcs = new Set();
+  if (!Orig) return;
+  function Hooked() {
+    var pc = new (Function.prototype.bind.apply(Orig, [null].concat([].slice.call(arguments))))();
+    window.__pcs.add(pc);
+    return pc;
+  }
+  Hooked.prototype = Orig.prototype;
+  Object.setPrototypeOf(Hooked, Orig);
+  window.RTCPeerConnection = Hooked;
+  if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = Hooked;
+})();
+</script>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #5d6673; --line: #dde1e6;
+  --accent: #2563eb; --accent-text: #ffffff; --ok: #15803d; --warn: #b45309; --bad: #b91c1c;
+  --chip: #eef2f7; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --card: #171b21; --text: #e6e9ee; --muted: #9aa4b2; --line: #2a313b;
+    --accent: #3b82f6; --accent-text: #ffffff; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --chip: #222832;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --card: #171b21; --text: #e6e9ee; --muted: #9aa4b2; --line: #2a313b;
+  --accent: #3b82f6; --accent-text: #ffffff; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --chip: #222832;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", "PingFang TC", sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 12px 16px 48px; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 4px 0; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+#clock { font: 600 26px/1.1 var(--mono); letter-spacing: .5px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-top: 12px; }
+.banner { background: var(--bad); color: #fff; border-radius: 10px; padding: 10px 12px; margin-top: 12px; display: none; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.chip { background: var(--chip); border-radius: 999px; padding: 2px 10px; font-size: 13px; color: var(--muted); }
+#phase { font-weight: 700; font-size: 17px; }
+.phase-idle { color: var(--muted); } .phase-ringing { color: var(--warn); }
+.phase-connecting { color: var(--warn); } .phase-talking, .phase-waiting { color: var(--ok); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; }
+.metric { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-width: 0; }
+.metric .k { font-size: 12px; color: var(--muted); }
+.metric .v { font: 600 18px/1.3 var(--mono); overflow-wrap: anywhere; }
+.metric.hl { border-color: var(--accent); }
+.meter { height: 10px; background: var(--chip); border-radius: 5px; overflow: hidden; margin-top: 10px; }
+.meter > div { height: 100%; width: 0; background: var(--ok); transition: width .08s linear; }
+button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text);
+  border-radius: 10px; padding: 10px 14px; min-height: 44px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+button.danger { background: var(--bad); color: #fff; border-color: var(--bad); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.actions button { flex: 1 1 120px; }
+details > summary { cursor: pointer; font-weight: 600; padding: 4px 0; }
+.form { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px 12px; margin-top: 8px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); min-width: 0; }
+input, select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px; min-height: 40px; width: 100%; }
+.hint { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+.only-agora, .only-livekit { display: contents; }
+#log { font: 12px/1.45 var(--mono); max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--bg); border-radius: 8px; padding: 8px; margin: 0; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; }
+td.num { font-family: var(--mono); text-align: right; }
+.ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Call Meter 通話量測</h1>
+    <div id="clock">--:--:--.---</div>
+  </header>
+  <div id="insecure" class="banner">這個頁面不是 HTTPS，手機瀏覽器不會允許使用麥克風。請改用 HTTPS 網址開啟。</div>
+  <div id="sdkError" class="banner"></div>
+  <div id="audioWarn" class="banner">瀏覽器暫停了音訊處理，聲音偵測會失準。請點一下畫面，並讓這個頁面保持在前景。</div>
+
+  <section class="card">
+    <div class="row">
+      <span id="phase" class="phase-idle">閒置</span>
+      <span class="chip" id="chipBackend">-</span>
+      <span class="chip" id="chipRole">-</span>
+      <span class="chip" id="chipMode">-</span>
+      <span class="chip" id="chipScenario">-</span>
+      <span class="chip" id="chipLoop" hidden></span>
+    </div>
+    <div class="grid">
+      <div class="metric hl"><div class="k">接聽 → 聽到聲音</div><div class="v" id="mAccept">-</div></div>
+      <div class="metric"><div class="k">加入頻道耗時</div><div class="v" id="mJoin">-</div></div>
+      <div class="metric"><div class="k">發布耗時</div><div class="v" id="mPublish">-</div></div>
+      <div class="metric"><div class="k">連線狀態</div><div class="v" id="mConn">-</div></div>
+      <div class="metric"><div class="k">掉包（每秒）</div><div class="v" id="mLoss">-</div></div>
+      <div class="metric"><div class="k">抖動</div><div class="v" id="mJitter">-</div></div>
+      <div class="metric"><div class="k">RTT</div><div class="v" id="mRtt">-</div></div>
+      <div class="metric"><div class="k">端到端延遲（Agora）</div><div class="v" id="mE2e">-</div></div>
+      <div class="metric"><div class="k">接收位元率</div><div class="v" id="mKbps">-</div></div>
+      <div class="metric"><div class="k">傳輸</div><div class="v" id="mProto">-</div></div>
+      <div class="metric"><div class="k">斷音（次／總長）</div><div class="v" id="mGaps">-</div></div>
+      <div class="metric"><div class="k">網路品質（上／下）</div><div class="v" id="mNetq">-</div></div>
+    </div>
+    <div class="meter" title="對方音量"><div id="levelBar"></div></div>
+
+    <div class="actions" id="callerActions">
+      <button class="primary" id="btnDial">撥號（加入並持續發送）</button>
+      <button class="danger" id="btnCallerHangup" disabled>掛斷</button>
+    </div>
+    <div class="actions" id="calleeActions">
+      <button class="primary" id="btnRing">模擬來電</button>
+      <button class="primary" id="btnAccept" disabled>接聽</button>
+      <button class="danger" id="btnCalleeHangup" disabled>掛斷</button>
+    </div>
+    <div class="actions" id="loopActions">
+      <button id="btnLoop">開始自動循環</button>
+    </div>
+    <p class="hint" id="roleHint"></p>
+  </section>
+
+  <section class="card">
+    <details id="settingsBox" open>
+      <summary>設定</summary>
+      <div class="form">
+        <label>後端
+          <select id="backend"><option value="agora">Agora</option><option value="livekit">LiveKit</option></select>
+        </label>
+        <label>角色
+          <select id="role"><option value="caller">主叫（持續在頻道）</option><option value="callee">被叫（響鈴→接聽）</option></select>
+        </label>
+        <label>被叫加入頻道時機
+          <select id="joinMode">
+            <option value="after-accept">A：接聽後才加入（仿 Letstalk）</option>
+            <option value="pre-join">B：響鈴時預先加入、靜音</option>
+          </select>
+        </label>
+        <label>聲音來源
+          <select id="audioSource">
+            <option value="tone">測試音（自動量測用）</option>
+            <option value="gum">麥克風，getUserMedia 自訂音軌（仿 Letstalk）</option>
+            <option value="sdk">麥克風，SDK 內建音軌</option>
+          </select>
+        </label>
+        <label>頻道／房間名稱<input id="room" autocomplete="off"></label>
+        <label>網路情境
+          <select id="scenario">
+            <option>Wi-Fi</option><option>中華 5G</option><option>中華 4G</option>
+            <option>Wi-Fi→行動（接通後切換）</option><option>行動→Wi-Fi（接通後切換）</option>
+            <option>訊號弱（室內／地下室）</option><option>移動中（車上／捷運）</option><option>其他</option>
+          </select>
+        </label>
+        <label>備註（地點、訊號格數等）<input id="note" autocomplete="off"></label>
+        <label>裝置標籤（例：A-iPhone13）<input id="device" autocomplete="off"></label>
+
+        <div class="only-agora">
+          <label>Agora SDK 版本
+            <select id="agoraVersion"><option value="4.18.1">4.18.1（與 Letstalk 相同）</option><option value="4.24.9">4.24.9（較新）</option></select>
+          </label>
+          <label>Agora App ID<input id="agoraAppId" autocomplete="off" spellcheck="false"></label>
+          <label>Agora 臨時 Token（專案有 App Certificate 才需要，要和頻道名稱對應）<input id="agoraToken" type="password" autocomplete="off" spellcheck="false"></label>
+          <label>Agora 區域（setArea）
+            <select id="agoraArea"><option value="">預設（不設定，同 Letstalk）</option><option>ASIA</option><option>JAPAN</option><option>HKMC</option><option>OVERSEA</option><option>GLOBAL</option></select>
+          </label>
+          <label>Agora 雲代理
+            <select id="agoraProxy"><option value="0">關閉（同 Letstalk）</option><option value="3">UDP 雲代理</option><option value="5">TCP／TLS 443 雲代理</option></select>
+          </label>
+        </div>
+        <div class="only-livekit">
+          <label>LiveKit 伺服器（wss://…）<input id="lkUrl" autocomplete="off" spellcheck="false"></label>
+          <label>LiveKit API Key<input id="lkKey" autocomplete="off" spellcheck="false"></label>
+          <label>LiveKit API Secret（只用於測試伺服器）<input id="lkSecret" type="password" autocomplete="off"></label>
+        </div>
+
+        <label>自動循環：響鈴秒數<input id="ringSec" type="number" min="1" step="1"></label>
+        <label>自動循環：通話秒數<input id="talkSec" type="number" min="5" step="1"></label>
+        <label>自動循環：間隔秒數<input id="gapSec" type="number" min="3" step="1"></label>
+        <label>自動循環：次數<input id="cycles" type="number" min="1" step="1"></label>
+        <label>判定無聲的逾時秒數<input id="noAudioSec" type="number" min="5" step="1"></label>
+        <label>聲音門檻（0–1）<input id="levelThr" type="number" min="0.005" max="0.5" step="0.005"></label>
+      </div>
+      <p class="hint">切換「後端」或「Agora SDK 版本」會重新載入頁面。設定只存在這支手機的瀏覽器。LiveKit Secret 只能填自架測試伺服器的金鑰，測完請換掉。</p>
+    </details>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content: space-between">
+      <h2>紀錄（<span id="recCount">0</span> 筆）</h2>
+      <div class="row">
+        <button id="btnExportCsv">匯出 CSV</button>
+        <button id="btnExportJson">匯出 JSON</button>
+        <button id="btnClear">清除</button>
+      </div>
+    </div>
+    <div class="table-wrap"><table id="summary"></table></div>
+    <p class="hint"><a href="report.html" target="_blank" rel="noopener">開啟報表工具</a>：把多支手機匯出的檔案合併比較。</p>
+    <p class="hint">「接聽 → 聽到聲音」：被叫是從按下接聽算起；主叫是用對方送來的接聽訊息往回推算（扣掉 RTT 的一半），屬估計值。</p>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>事件紀錄</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
