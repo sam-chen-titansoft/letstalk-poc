@@ -82,6 +82,27 @@ table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; }
 td.num { font-family: var(--mono); text-align: right; }
+.path svg { display: block; width: 100%; height: auto; }
+.path .pn { fill: var(--bg); stroke: var(--line); stroke-width: 1.5; }
+.path .pn.srv { stroke: var(--accent); }
+.path .ph { font: 600 13px -apple-system, BlinkMacSystemFont, "Noto Sans TC", "PingFang TC", sans-serif; fill: var(--text); }
+.path .pt { font: 11px var(--mono); fill: var(--muted); }
+.path .pt.strong { fill: var(--text); font-weight: 600; }
+.path .pm { stroke: var(--accent); stroke-width: 2.5; }
+.path .pm.mesh { stroke-dasharray: 10 4; }
+.path .pm.off { stroke: var(--line); stroke-dasharray: 2 4; }
+.path .ps { stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.path .pa { fill: var(--muted); }
+.lg { display: inline-block; width: 22px; height: 0; vertical-align: middle; margin: 0 6px 0 10px; }
+.lg:first-child { margin-left: 0; }
+.lg-m { border-top: 3px solid var(--accent); }
+.lg-s { border-top: 2px dashed var(--muted); }
+.steps { margin: 6px 0 0; padding-left: 22px; font-size: 13px; }
+.steps li { padding: 3px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; flex-wrap: wrap; }
+.steps .sn { flex: 1 1 140px; }
+.steps .sm { font-family: var(--mono); min-width: 96px; text-align: right; }
+.steps .sd { font-family: var(--mono); color: var(--muted); min-width: 90px; }
+.steps .empty { color: var(--muted); display: list-item; border: 0; }
 .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 8px; }
 .chart { margin: 0; position: relative; border: 1px solid var(--line); border-radius: 10px; padding: 8px 8px 4px; min-width: 0; }
 .chart figcaption { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; color: var(--muted); }
@@ -167,6 +188,15 @@ td.num { font-family: var(--mono); text-align: right; }
         <button data-v="4">4 好</button><button data-v="5">5 很好</button><button data-v="skip">略過</button>
       </div>
     </div>
+  </section>
+
+  <section class="card">
+    <h2>通話路徑</h2>
+    <div id="pathDiagram" class="path"></div>
+    <p class="hint"><span class="lg lg-m"></span>媒體（聲音）<span class="lg lg-s"></span>訊令（加入房間、交換連線資訊）。每段標出連線方式和 RTT；對方那段由對方每 3 秒回報一次。</p>
+    <p class="hint" id="pathNote"></p>
+    <h2 id="stepsTitle" style="margin-top:12px">接通流程</h2>
+    <ol id="steps" class="steps"></ol>
   </section>
 
   <section class="card">

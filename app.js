@@ -250,14 +250,16 @@ function onFirstAudio(t) {
 // ---------- transport stats via hooked RTCPeerConnections ----------
 async function collectPcStats() {
   let best = null;
+  const paths = [];
   for (const pc of Array.from(window.__pcs || [])) {
     if (pc.connectionState === 'closed' || pc.signalingState === 'closed') { window.__pcs.delete(pc); continue; }
     let rep;
     try { rep = await pc.getStats(); } catch (e) { continue; }
     const byId = new Map();
     rep.forEach(r => byId.set(r.id, r));
-    let inbound = null, pair = null;
+    let inbound = null, pair = null, outbound = false;
     rep.forEach(r => {
+      if (r.type === 'outbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio') && (r.packetsSent || 0) > 0) outbound = true;
       if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.mediaType === 'audio')) {
         if (!inbound || (r.bytesReceived || 0) > (inbound.bytesReceived || 0)) inbound = r;
       }
@@ -265,9 +267,19 @@ async function collectPcStats() {
     });
     if (!pair) rep.forEach(r => { if (!pair && r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r; });
     const local = pair ? byId.get(pair.localCandidateId) : null;
+    const remote = pair ? byId.get(pair.remoteCandidateId) : null;
+    if (pair && local) {
+      paths.push({
+        send: outbound, recv: !!(inbound && inbound.packetsReceived), ctype: local.candidateType || '',
+        proto: (local.protocol || '').toLowerCase(), relay: local.relayProtocol || '',
+        raddr: remote ? (remote.address || remote.ip || '') : '', rport: remote ? remote.port : null,
+        rtt: pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
+      });
+    }
     const c = { inbound, pair, local };
     if (!best || (inbound && (!best.inbound || (inbound.bytesReceived || 0) > (best.inbound.bytesReceived || 0)))) best = c;
   }
+  S.paths = paths;
   return best;
 }
 
@@ -315,6 +327,8 @@ async function sampleTick() {
   s.e2eMs = ex.e2e != null ? ex.e2e : null;
   s.sdkLossPct = ex.sdkLoss != null ? ex.sdkLoss : null;
   if (s.rttMs != null) S.lastRtt = s.rttMs;
+  S.tick = (S.tick || 0) + 1;
+  if (S.tick % 3 === 0 && S.engine && S.engine.joined) S.engine.send(ownPath());
   s.mos = mosEstimate(s.concealPct != null ? s.concealPct : s.lossPct, s.rttMs, s.jbMs);
   S.live = Object.assign({}, S.live, s);
   pushSeries(s);
@@ -339,6 +353,137 @@ function startSampling() {
 }
 function stopSampling() {
   if (S.sampling) { clearInterval(S.sampling); S.sampling = null; }
+}
+
+// ---------- call path diagram ----------
+function nodeInfo() {
+  const e = S.engine;
+  if (cfg.backend === 'livekit') {
+    return { name: (e && e.edition) || 'LiveKit', region: (e && e.region) || '', node: (e && e.nodeId) || '', version: (e && e.serverVersion) || '' };
+  }
+  return { name: 'Agora SD-RTN', region: cfg.agoraArea || '自動選擇', node: '', version: '' };
+}
+function mainPath(list) {
+  if (!list || !list.length) return null;
+  return list.find(p => p.recv) || list.find(p => p.send) || list[0];
+}
+function ownPath() {
+  const p = mainPath(S.paths) || {};
+  const n = nodeInfo();
+  return { t: 'path', role: cfg.role, device: cfg.device || '', scenario: cfg.scenario, ctype: p.ctype || '', proto: p.proto || '', relay: p.relay || '',
+    rtt: p.rtt == null ? null : p.rtt, pcs: (S.paths || []).length, raddr: p.raddr || '', rport: p.rport || null, region: n.region, node: n.node };
+}
+const CTYPE_LABEL = { host: '直連（同網段）', srflx: '經 NAT 直連', prflx: '經 NAT 直連', relay: 'TURN 中繼' };
+function legText(p) {
+  if (!p || !p.ctype) return ['等待連線資料…', ''];
+  const proto = p.relay ? `TURN/${p.relay.toUpperCase()}` : (p.proto || '').toUpperCase();
+  return [`${CTYPE_LABEL[p.ctype] || p.ctype} · ${proto}`, p.rtt == null ? '' : `RTT ${p.rtt} ms`];
+}
+
+function callSteps(rec) {
+  if (!rec) return [];
+  const ss = S.session || {};
+  const raw = rec.role === 'callee'
+    ? [['響鈴', rec.ringAt], ['按下接聽', rec.acceptAt], ['訊令連上伺服器', rec.connectedAt], ['加入房間', rec.joinedAt],
+      ['開始送出聲音', rec.publishedAt], ['收到對方音軌', rec.remoteTrackAt], ['聽到對方聲音', rec.firstAudioAt]]
+    : [['撥號', ss.dialAt], ['訊令連上伺服器', ss.connectedAt], ['加入房間', ss.joinedAt], ['開始送出聲音', ss.publishedAt],
+      ['對方按下接聽（推算）', rec.acceptAt], ['收到對方音軌', rec.remoteTrackAt], ['聽到對方聲音', rec.firstAudioAt]];
+  const pts = raw.filter(x => x[1] != null).sort((a, b) => a[1] - b[1]);
+  if (!pts.length) return [];
+  const base = pts[0][1];
+  return pts.map(([name, t]) => ({ name, ms: Math.round(t - base) }));
+}
+
+function renderPath() {
+  const box = $('pathDiagram');
+  if (!box) return;
+  const W = Math.max(300, box.clientWidth);
+  const own = mainPath(S.paths);
+  const peer = S.peerPath && now() - S.peerPath.at < 15000 ? S.peerPath : null;
+  const node = nodeInfo();
+  const joined = !!(S.engine && S.engine.joined);
+  const lk = cfg.backend === 'livekit';
+  const roleName = r => r === 'caller' ? '主叫' : r === 'callee' ? '被叫' : '對方';
+  const addr = p => p && p.raddr ? `${p.raddr}${p.rport ? ':' + p.rport : ''}` : '';
+  const split = !!(own && own.raddr && peer && peer.raddr && own.raddr !== peer.raddr);
+  const srv = (title, region, nodeId, a) => ({ title, server: true,
+    lines: [region ? `區域：${region}` : '區域：-', nodeId ? `節點：${nodeId}` : '', a ? `媒體位址：${a}` : ''].filter(Boolean) });
+  const me = { title: `本機（${roleName(cfg.role)}）`, lines: [cfg.device || '未填裝置標籤', cfg.scenario || ''] };
+  const them = { title: peer ? `對方（${roleName(peer.role)}）` : '對方', lines: peer ? [peer.device || '未填裝置標籤', peer.scenario || ''] : [joined ? '等待對方加入並回報' : '尚未通話'] };
+  let nodes, legs;
+  if (split) {
+    nodes = [me, srv(`${node.name}（本機連入）`, node.region, node.node, addr(own)), srv(`${node.name}（對方連入）`, peer.region, peer.node, addr(peer)), them];
+    legs = [{ media: legText(own), ok: true, sig: true }, { media: [lk ? 'LiveKit 內部骨幹轉送' : 'SD-RTN 內部路由（不公開）', '我們量不到這段'], ok: true, sig: false, mesh: true },
+      { media: legText(peer), ok: !!peer.ctype, sig: true }];
+  } else {
+    const same = own && peer && own.raddr && peer.raddr && own.raddr === peer.raddr;
+    const n = srv(node.name, node.region, node.node, addr(own));
+    if (same) n.lines.push('雙方連到同一節點');
+    nodes = [me, n, them];
+    legs = [{ media: legText(own), ok: !!(own && own.ctype), sig: true }, { media: peer ? legText(peer) : ['等待對方回報…', ''], ok: !!(peer && peer.ctype), sig: true }];
+  }
+  const N = nodes.length;
+  const bwH = N === 4 ? 180 : 210, gapMin = N === 4 ? 140 : 150;
+  const vertical = W < N * bwH + (N - 1) * gapMin + 20;
+  const bw = vertical ? Math.min(W - 24, 300) : bwH;
+  const bh = 90;
+  let pos, H;
+  if (vertical) {
+    const gap = 104, x = (W - bw) / 2;
+    pos = nodes.map((_, i) => ({ x, y: 10 + i * (bh + gap) }));
+    H = 20 + N * bh + (N - 1) * gap;
+  } else {
+    const gap = (W - N * bw - 20) / (N - 1);
+    pos = nodes.map((_, i) => ({ x: 10 + i * (bw + gap), y: 34 }));
+    H = bh + 34 + 60;
+  }
+  const t = s => escapeHtml(s || '');
+  let h = '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" class="pa"/></marker></defs>';
+  legs.forEach((leg, i) => {
+    const a = pos[i], b = pos[i + 1];
+    const [l1, l2] = leg.media;
+    const cls = `pm${leg.ok ? '' : ' off'}${leg.mesh ? ' mesh' : ''}`;
+    if (vertical) {
+      const cx = a.x + bw / 2, y1 = a.y + bh, y2 = b.y, mx = leg.sig ? cx + 30 : cx;
+      if (leg.sig) {
+        h += `<line x1="${cx - 30}" y1="${y1}" x2="${cx - 30}" y2="${y2}" class="ps" marker-start="url(#arr)" marker-end="url(#arr)"/>`;
+        h += `<text x="${cx - 38}" y="${(y1 + y2) / 2 + 4}" text-anchor="end" class="pt">訊令 WSS</text>`;
+      }
+      h += `<line x1="${mx}" y1="${y1}" x2="${mx}" y2="${y2}" class="${cls}" marker-start="url(#arr)" marker-end="url(#arr)"/>`;
+      h += `<text x="${mx + 8}" y="${(y1 + y2) / 2 - 4}" class="pt strong">${t(l1)}</text><text x="${mx + 8}" y="${(y1 + y2) / 2 + 12}" class="pt">${t(l2)}</text>`;
+    } else {
+      const x1 = a.x + bw, x2 = b.x, ys = a.y + 22, ym = leg.sig ? a.y + bh - 22 : a.y + bh / 2;
+      if (leg.sig) {
+        h += `<line x1="${x1}" y1="${ys}" x2="${x2}" y2="${ys}" class="ps" marker-start="url(#arr)" marker-end="url(#arr)"/>`;
+        h += `<text x="${(x1 + x2) / 2}" y="${ys - 6}" text-anchor="middle" class="pt">訊令 WSS</text>`;
+      }
+      h += `<line x1="${x1}" y1="${ym}" x2="${x2}" y2="${ym}" class="${cls}" marker-start="url(#arr)" marker-end="url(#arr)"/>`;
+      h += `<text x="${(x1 + x2) / 2}" y="${ym + 18}" text-anchor="middle" class="pt strong">${t(l1)}</text>`;
+      h += `<text x="${(x1 + x2) / 2}" y="${ym + 34}" text-anchor="middle" class="pt">${t(l2)}</text>`;
+    }
+  });
+  nodes.forEach((n, i) => {
+    const p = pos[i];
+    h += `<rect x="${p.x}" y="${p.y}" width="${bw}" height="${bh}" rx="10" class="pn${n.server ? ' srv' : ''}"/>`;
+    h += `<text x="${p.x + 12}" y="${p.y + 22}" class="ph">${t(n.title)}</text>`;
+    n.lines.slice(0, 4).forEach((l, j) => { h += `<text x="${p.x + 12}" y="${p.y + 40 + j * 15}" class="pt">${t(l)}</text>`; });
+  });
+  if (!vertical) h += `<text x="${W / 2}" y="16" text-anchor="middle" class="pt">${t(lk ? 'SFU：伺服器只轉發聲音、不混音；雙方各自連到最近的節點' : 'Agora：雙方各自連進 SD-RTN 邊緣節點，中間的路由不公開')}</text>`;
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="通話路徑圖">${h}</svg>`;
+
+  const pcs = S.paths || [];
+  $('pathNote').textContent = joined
+    ? `本機建立 ${pcs.length} 條 WebRTC 連線（${pcs.map(p => p.send && p.recv ? '收發' : p.send ? '送出' : p.recv ? '接收' : '待命').join('、') || '-'}）。接聽、掛斷等訊息走媒體伺服器的資料通道轉送。` +
+      (split ? '雙方連到不同節點，中間那段由服務商內部轉送。' : '')
+    : '撥號或接聽後，這裡會畫出實際連上的節點和傳輸方式。';
+
+  const rec = S.cur || null;
+  const steps = rec ? callSteps(rec) : (S.records.length ? (S.records[S.records.length - 1].steps || []) : []);
+  $('stepsTitle').textContent = rec ? '接通流程（這一通，進行中）' : (steps.length ? '接通流程（上一通）' : '接通流程');
+  $('steps').innerHTML = steps.length ? steps.map((st, i) => {
+    const d = i ? st.ms - steps[i - 1].ms : 0;
+    return `<li><span class="sn">${t(st.name)}</span><span class="sm">+${st.ms.toLocaleString()} ms</span><span class="sd">${i ? '（+' + d.toLocaleString() + '）' : ''}</span></li>`;
+  }).join('') : '<li class="empty">還沒有通話。</li>';
 }
 
 // ---------- live charts ----------
@@ -475,7 +620,12 @@ const H = {
     if (state === 'RECONNECTING' || state === 'SIGNALRECONNECTING') {
       if (!S.reconnectStart) { S.reconnectStart = now(); chartMark('reconnect'); }
       if (rec) rec.reconnects++;
-    } else if (state === 'CONNECTED' && S.reconnectStart) {
+    }
+    if (state === 'CONNECTED') {
+      if (rec && !rec.connectedAt) rec.connectedAt = now();
+      if (S.session && !S.session.connectedAt) S.session.connectedAt = now();
+    }
+    if (state === 'CONNECTED' && S.reconnectStart) {
       const ms = Math.round(now() - S.reconnectStart);
       S.reconnectStart = null;
       logEvt('recovered', `${ms} ms`);
@@ -490,6 +640,7 @@ const H = {
   remoteTrack(mst, play, stop, level) {
     S.remote = { mst, play, stop, level, playing: false };
     attachAnalyser(mst);
+    S.remoteTrackAt = now();
     if (S.cur && !S.cur.remoteTrackAt) S.cur.remoteTrackAt = now();
     logEvt('remote_audio_track');
     if (cfg.role === 'caller' || (S.cur && S.cur.acceptAt)) startPlayback();
@@ -502,6 +653,7 @@ const H = {
   },
   message(m) {
     if (!m || !m.t) return;
+    if (m.t === 'path') { S.peerPath = Object.assign({}, m, { at: now() }); return; }
     logEvt('msg', m.t + (m.cycle != null ? ' #' + m.cycle : '') + (m.source ? ' source=' + m.source : ''));
     if (m.t === 'peer' && cfg.role === 'callee') {
       if (S.cur && S.cur.cycle === m.cycle) S.cur.peerSource = m.source || null;
@@ -517,6 +669,7 @@ const H = {
       rec.peerScenario = m.scenario || '';
       rec.peerSource = m.source || null;
       S.engine.send({ t: 'peer', cycle: m.cycle, source: cfg.audioSource });
+      if (!rec.remoteTrackAt && S.remoteTrackAt) rec.remoteTrackAt = S.remoteTrackAt;
       rec.joinMs = S.session ? S.session.joinMs : null;
       rec.publishMs = S.session ? S.session.publishMs : null;
       const half = (S.lastRtt || 0) / 2;
@@ -694,6 +847,9 @@ class LiveKitEngine {
     this.joined = true;
     const info = room.serverInfo || {};
     this.region = info.region || '';
+    this.nodeId = info.nodeId || '';
+    this.serverVersion = info.version || '';
+    this.edition = info.edition === 1 ? 'LiveKit Cloud' : 'LiveKit 自架';
     if (S.cur && cfg.backend === 'livekit') S.cur.area = this.region;
     logEvt('joined', `${identity} region=${this.region || '-'} server=${info.edition === 1 ? 'cloud' : 'self-hosted'} ${info.version || ''}`);
   }
@@ -808,6 +964,7 @@ function finalize(result, error) {
   if (S.audioCtx && S.audioCtx.state !== 'running') rec.error = (rec.error ? rec.error + '; ' : '') + 'audioctx_' + S.audioCtx.state;
   const summary = summarize(rec);
   const full = Object.assign({}, summary, {
+    steps: callSteps(rec), path: { own: S.paths || [], peer: S.peerPath || null, node: nodeInfo() },
     milestones: {
       ringAt: rel(rec, rec.ringAt), acceptAt: rel(rec, rec.acceptAt), joinedAt: rel(rec, rec.joinedAt),
       publishedAt: rel(rec, rec.publishedAt), remoteTrackAt: rel(rec, rec.remoteTrackAt),
@@ -862,7 +1019,9 @@ async function callerDial() {
   requestWakeLock();
   newEngine();
   setPhase('dialing');
-  S.session = {};
+  S.session = { dialAt: now() };
+  S.peerPath = null;
+  S.remoteTrackAt = null;
   S.aud = newAud();
   try {
     const mst = await sourceTrack();
@@ -870,9 +1029,11 @@ async function callerDial() {
     let t = now();
     await S.engine.join(cfg.room);
     S.session.joinMs = Math.round(now() - t);
+    S.session.joinedAt = now();
     t = now();
     await S.engine.publish();
     S.session.publishMs = Math.round(now() - t);
+    S.session.publishedAt = now();
     S.live.join = S.session.joinMs;
     S.live.publish = S.session.publishMs;
     startSampling();
@@ -1219,6 +1380,8 @@ async function init() {
   drawCharts();
   setInterval(levelTick, 50);
   setInterval(() => { renderLive(); applyVisibility(); }, 250);
+  setInterval(renderPath, 1000);
+  renderPath();
 
   $('btnDial').onclick = callerDial;
   $('btnCallerHangup').onclick = callerHangup;
