@@ -226,7 +226,8 @@ const fmt0 = (v, unit = '') => v == null ? '–' : Math.round(v) + unit;
 const MODE_LABEL = { 'after-accept': 'A 接聽後加入', 'pre-join': 'B 預先加入', app: '（App）' };
 function settingKey(r) {
   if (r.backend === 'letstalk') return 'Letstalk App（人工）';
-  const extra = r.backend === 'agora' ? ` · 區域 ${r.area || 'default'}${r.proxy && r.proxy !== '0' ? ' · 雲代理 ' + r.proxy : ''}` : '';
+  const extra = r.backend === 'agora' ? ` · 區域 ${r.area || 'default'}${r.proxy && r.proxy !== '0' ? ' · 雲代理 ' + r.proxy : ''}`
+    : r.backend === 'livekit' ? ` · 區域 ${r.area || '-'}${r.proxy === 'relay' ? ' · 強制 TURN' : ''}` : '';
   return `${r.sdk || r.backend}${extra}`;
 }
 function groupKey(r) { return `${settingKey(r)} | ${MODE_LABEL[r.joinMode] || r.joinMode || ''} | ${r.scenario || '未標情境'}`; }

@@ -112,7 +112,7 @@ td.num { font-family: var(--mono); text-align: right; }
       <div class="metric"><div class="k">掉包（每秒）</div><div class="v" id="mLoss">-</div></div>
       <div class="metric"><div class="k">抖動</div><div class="v" id="mJitter">-</div></div>
       <div class="metric"><div class="k">RTT</div><div class="v" id="mRtt">-</div></div>
-      <div class="metric"><div class="k">端到端延遲（Agora）</div><div class="v" id="mE2e">-</div></div>
+      <div class="metric"><div class="k">端到端延遲（僅 Agora）</div><div class="v" id="mE2e">-</div></div>
       <div class="metric"><div class="k">接收位元率</div><div class="v" id="mKbps">-</div></div>
       <div class="metric"><div class="k">傳輸</div><div class="v" id="mProto">-</div></div>
       <div class="metric"><div class="k">斷音（次／總長）</div><div class="v" id="mGaps">-</div></div>
@@ -186,6 +186,9 @@ td.num { font-family: var(--mono); text-align: right; }
           <label>LiveKit 伺服器（wss://…）<input id="lkUrl" autocomplete="off" spellcheck="false"></label>
           <label>LiveKit API Key<input id="lkKey" autocomplete="off" spellcheck="false"></label>
           <label>LiveKit API Secret（只用於測試伺服器）<input id="lkSecret" type="password" autocomplete="off"></label>
+          <label>LiveKit 傳輸路徑
+            <select id="lkRelay"><option value="0">自動（UDP 直連優先）</option><option value="1">強制走 TURN 中繼（對照 Agora 雲代理）</option></select>
+          </label>
         </div>
 
         <label>自動循環：響鈴秒數<input id="ringSec" type="number" min="1" step="1"></label>

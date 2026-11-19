@@ -14,7 +14,7 @@ const DEFAULTS = {
   backend: 'agora', role: 'caller', joinMode: 'after-accept', audioSource: 'tone',
   room: 'callmeter-' + Math.random().toString(36).slice(2, 7), scenario: 'Wi-Fi', note: '', device: '',
   agoraVersion: '4.18.1', agoraAppId: '', agoraToken: '', agoraArea: '', agoraProxy: '0',
-  lkUrl: '', lkKey: '', lkSecret: '',
+  lkUrl: '', lkKey: '', lkSecret: '', lkRelay: '0',
   ringSec: 3, talkSec: 20, gapSec: 8, cycles: 30, noAudioSec: 30, levelThr: 0.05,
 };
 const CFG_KEY = 'callmeter.cfg.v1';
@@ -49,7 +49,7 @@ function safeSet(key, value) {
 // ---------- config ----------
 const cfg = Object.assign({}, DEFAULTS, safeGet(CFG_KEY, {}));
 const FIELDS = ['backend', 'role', 'joinMode', 'audioSource', 'room', 'scenario', 'note', 'device',
-  'agoraVersion', 'agoraAppId', 'agoraToken', 'agoraArea', 'agoraProxy', 'lkUrl', 'lkKey', 'lkSecret',
+  'agoraVersion', 'agoraAppId', 'agoraToken', 'agoraArea', 'agoraProxy', 'lkUrl', 'lkKey', 'lkSecret', 'lkRelay',
   'ringSec', 'talkSec', 'gapSec', 'cycles', 'noAudioSec', 'levelThr'];
 const RELOAD_FIELDS = new Set(['backend', 'agoraVersion']);
 const NUM_FIELDS = new Set(['ringSec', 'talkSec', 'gapSec', 'cycles', 'noAudioSec', 'levelThr']);
@@ -59,7 +59,7 @@ const NUM_FIELDS = new Set(['ringSec', 'talkSec', 'gapSec', 'cycles', 'noAudioSe
 const HASH_KEYS = {
   appid: 'agoraAppId', token: 'agoraToken', room: 'room', role: 'role', mode: 'joinMode', backend: 'backend', ver: 'agoraVersion',
   area: 'agoraArea', proxy: 'agoraProxy', source: 'audioSource', scenario: 'scenario', device: 'device',
-  lkurl: 'lkUrl', lkkey: 'lkKey', ring: 'ringSec', talk: 'talkSec', gap: 'gapSec', cycles: 'cycles',
+  lkurl: 'lkUrl', lkkey: 'lkKey', relay: 'lkRelay', ring: 'ringSec', talk: 'talkSec', gap: 'gapSec', cycles: 'cycles',
 };
 function applyHashConfig() {
   if (!location.hash || location.hash.length < 2) return 0;
@@ -319,7 +319,7 @@ const H = {
     logEvt('conn', `${state}${reason ? ' (' + reason + ')' : ''}`);
     const rec = S.cur;
     if (rec && rec.connTrail.length < 40) rec.connTrail.push(state + (reason ? `(${reason})` : ''));
-    if (state === 'RECONNECTING') {
+    if (state === 'RECONNECTING' || state === 'SIGNALRECONNECTING') {
       if (!S.reconnectStart) S.reconnectStart = now();
       if (rec) rec.reconnects++;
     } else if (state === 'CONNECTED' && S.reconnectStart) {
@@ -332,7 +332,7 @@ const H = {
   netq(up, down) {
     S.live.netq = `${up} / ${down}`;
     const rec = S.cur;
-    if (rec && typeof down === 'number') rec.worstDownQuality = Math.max(rec.worstDownQuality || 0, down);
+    if (rec && typeof down === 'number' && down > 0) rec.worstDownQuality = Math.max(rec.worstDownQuality || 0, down);
   },
   remoteTrack(mst, play, stop, level) {
     S.remote = { mst, play, stop, level, playing: false };
@@ -521,13 +521,22 @@ class LiveKitEngine {
         () => (p && typeof p.audioLevel === 'number' ? p.audioLevel : 0));
     });
     room.on(E.TrackUnsubscribed, (track) => { if (track.kind === 'audio') H.remoteGone(); });
-    room.on(E.ConnectionQualityChanged, (q, p) => { if (p && p === room.localParticipant) H.netq(q, q); });
+    room.on(E.ConnectionQualityChanged, (q, p) => {
+      if (!p || p !== room.localParticipant) return;
+      H.netq(LK_QUALITY[q] || 0, LK_QUALITY[q] || 0);
+      S.live.netq = q;
+    });
     room.on(E.DataReceived, payload => {
       try { H.message(JSON.parse(new TextDecoder().decode(payload))); } catch (e) { /* ignore */ }
     });
-    await room.connect(cfg.lkUrl, token, { autoSubscribe: true });
+    const opts = { autoSubscribe: true };
+    if (cfg.lkRelay === '1') opts.rtcConfig = { iceTransportPolicy: 'relay' };
+    await room.connect(cfg.lkUrl, token, opts);
     this.joined = true;
-    logEvt('joined', identity);
+    const info = room.serverInfo || {};
+    this.region = info.region || '';
+    if (S.cur && cfg.backend === 'livekit') S.cur.area = this.region;
+    logEvt('joined', `${identity} region=${this.region || '-'} server=${info.edition === 1 ? 'cloud' : 'self-hosted'} ${info.version || ''}`);
   }
   async publish() {
     const LK = window.LivekitClient;
@@ -554,6 +563,9 @@ class LiveKitEngine {
   resumeAudio() { try { if (this.room) this.room.startAudio(); } catch (e) { /* ignore */ } }
 }
 
+// Mapped onto Agora's network-quality scale (1 best … 6 down) so worstDownQuality compares across backends.
+const LK_QUALITY = { excellent: 1, good: 2, poor: 4, lost: 6 };
+
 function newEngine() {
   S.engine = cfg.backend === 'livekit' ? new LiveKitEngine() : new AgoraEngine();
   return S.engine;
@@ -567,8 +579,8 @@ function newRecord(role) {
     startedAt: new Date().toISOString(), role, backend: cfg.backend,
     sdk: S.engine ? S.engine.label() : cfg.backend,
     joinMode: cfg.joinMode, audioSource: cfg.audioSource,
-    area: cfg.backend === 'agora' ? (cfg.agoraArea || 'default') : '',
-    proxy: cfg.backend === 'agora' ? String(cfg.agoraProxy) : '',
+    area: cfg.backend === 'agora' ? (cfg.agoraArea || 'default') : ((S.engine && S.engine.region) || ''),
+    proxy: cfg.backend === 'agora' ? String(cfg.agoraProxy) : (cfg.lkRelay === '1' ? 'relay' : '0'),
     scenario: cfg.scenario, note: cfg.note, device: cfg.device,
     ua: navigator.userAgent.slice(0, 160), cycle: null,
     ringAt: null, acceptAt: null, acceptEstimated: false, joinedAt: null, publishedAt: null,
@@ -975,7 +987,7 @@ function applyVisibility() {
   document.querySelectorAll('.only-agora').forEach(e => { e.hidden = cfg.backend !== 'agora'; });
   document.querySelectorAll('.only-livekit').forEach(e => { e.hidden = cfg.backend !== 'livekit'; });
   const busy = S.phase !== 'idle';
-  ['backend', 'role', 'joinMode', 'audioSource', 'room', 'agoraVersion', 'agoraAppId', 'agoraToken', 'agoraArea', 'agoraProxy', 'lkUrl', 'lkKey', 'lkSecret']
+  ['backend', 'role', 'joinMode', 'audioSource', 'room', 'agoraVersion', 'agoraAppId', 'agoraToken', 'agoraArea', 'agoraProxy', 'lkUrl', 'lkKey', 'lkSecret', 'lkRelay']
     .forEach(f => { const el = $(f); if (el) el.disabled = busy; });
 }
 
