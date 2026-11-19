@@ -102,7 +102,7 @@ td.wrap { white-space: normal; min-width: 220px; }
   <section class="card">
     <h2>各組完整指標</h2>
     <div class="table-wrap"><table id="groupTable"></table></div>
-    <p class="note">掉包、抖動、RTT、延遲只算「已聽到聲音之後」的秒數，再對每通取平均。斷音只在聲音來源為測試音時有意義。UDP 比例只算有拿到傳輸資訊的通話。</p>
+    <p class="note">掉包、抖動、RTT、延遲只算「已聽到聲音之後」的秒數，再對每通取平均。斷音和接聽→出聲只計入「對方送測試音」的通話。隱藏比例是解碼器補出來的聲音占比（扣掉靜音段）；MOS 估計依 ITU-T E-model 推算，只適合互相比較。UDP 比例只算有拿到傳輸資訊的通話。</p>
   </section>
 
   <section class="card">
@@ -129,7 +129,8 @@ let ALL = [];   // merged records, deduped by id
 // ---------- parsing ----------
 const NUMERIC = new Set(['cycle', 'acceptToFirstAudioMs', 'joinMs', 'publishMs', 'ringToJoinedMs', 'acceptToJoinedMs',
   'acceptToRemoteTrackMs', 'talkSeconds', 'avgLossPct', 'maxLossPct', 'avgJitterMs', 'avgRttMs', 'maxRttMs', 'avgE2eMs',
-  'avgKbps', 'gapCount', 'gapTotalMs', 'longestGapMs', 'reconnects', 'worstDownQuality']);
+  'avgKbps', 'gapCount', 'gapTotalMs', 'longestGapMs', 'reconnects', 'worstDownQuality',
+  'avgConcealPct', 'maxConcealPct', 'concealEvents', 'avgJbMs', 'mosEst', 'mosP10', 'userRating']);
 
 function parseCsv(text) {
   text = text.replace(/^﻿/, '');
@@ -164,6 +165,8 @@ function normalize(r) {
   }
   if (o.acceptEstimated === 'true') o.acceptEstimated = true;
   if (o.acceptEstimated === 'false') o.acceptEstimated = false;
+  if (o.toneMeasured === 'true') o.toneMeasured = true;
+  if (o.toneMeasured === 'false') o.toneMeasured = false;
   return o;
 }
 
@@ -235,8 +238,10 @@ function groupKey(r) { return `${settingKey(r)} | ${MODE_LABEL[r.joinMode] || r.
 function stats(list) {
   const ok = list.filter(r => r.result === 'ok');
   const a2a = ok.map(r => r.acceptToFirstAudioMs).filter(num);
-  const talk = ok.reduce((s, r) => s + (r.talkSeconds || 0), 0);
-  const gaps = ok.reduce((s, r) => s + (r.gapCount || 0), 0);
+  const toneOk = ok.filter(r => r.toneMeasured !== false);
+  const talk = toneOk.reduce((s, r) => s + (r.talkSeconds || 0), 0);
+  const gaps = toneOk.reduce((s, r) => s + (r.gapCount || 0), 0);
+  const rating = list.map(r => r.userRating).filter(num);
   const withProto = ok.filter(r => r.protocol);
   const recov = ok.flatMap(r => String(r.recoveryMs || '').split('|').filter(Boolean).map(Number)).filter(num);
   const pick = k => ok.map(r => r[k]).filter(num);
@@ -249,7 +254,10 @@ function stats(list) {
     joinMed: med(list.map(r => r.joinMs).filter(num)),
     loss: avg(pick('avgLossPct')), lossP90: q(pick('avgLossPct'), 90), jitter: avg(pick('avgJitterMs')),
     rtt: avg(pick('avgRttMs')), e2e: avg(pick('avgE2eMs')),
-    gapsPerMin: talk > 0 ? gaps / (talk / 60) : null, gapTotal: avg(pick('gapTotalMs')),
+    gapsPerMin: talk > 0 ? gaps / (talk / 60) : null, gapTotal: avg(toneOk.map(r => r.gapTotalMs).filter(num)),
+    conceal: avg(pick('avgConcealPct')), concealP90: q(pick('avgConcealPct'), 90),
+    mos: avg(pick('mosEst')), mosP10: q(pick('mosEst'), 10),
+    rating: avg(rating), ratingN: rating.length,
     reconnects: list.reduce((s, r) => s + (r.reconnects || 0), 0), recovMed: med(recov),
     udpShare: withProto.length ? withProto.filter(r => /udp/.test(r.protocol) && !/tcp/.test(r.protocol)).length / withProto.length : null,
     relayShare: withProto.length ? ok.filter(r => /relay/.test(r.candidateType || '')).length / withProto.length : null,
@@ -319,13 +327,16 @@ function renderAB(list) {
 function renderGroups(gs) {
   const head = '<tr><th>後端與設定 | 模式 | 情境</th><th>筆數</th><th>成功率</th><th>沒出聲</th><th>加入失敗</th><th>其他</th>' +
     '<th>接聽→出聲 中位</th><th>P90</th><th>最大</th><th>加入耗時 中位</th><th>掉包 平均</th><th>掉包 P90</th><th>抖動</th><th>RTT</th>' +
-    '<th>端到端延遲</th><th>斷音／分鐘</th><th>斷音總長 平均</th><th>重連</th><th>恢復 中位</th><th>UDP 比例</th><th>中繼比例</th></tr>';
+    '<th>端到端延遲</th><th>隱藏比例 平均</th><th>隱藏比例 P90</th><th>MOS 估計 平均</th><th>MOS P10</th><th>人工評分（筆數）</th>' +
+    '<th>斷音／分鐘</th><th>斷音總長 平均</th><th>重連</th><th>恢復 中位</th><th>UDP 比例</th><th>中繼比例</th></tr>';
   const body = gs.map(([k, list]) => {
     const s = stats(list);
     return `<tr><td>${esc(k)}</td><td class="num">${s.n}</td><td class="num">${fmtPct(s.okRate)}</td><td class="num">${s.noAudio}</td><td class="num">${s.joinFailed}</td><td class="num">${s.otherFail}</td>` +
       `<td class="num">${fmtMs(s.a2aMed)}</td><td class="num">${fmtMs(s.a2aP90)}</td><td class="num">${fmtMs(s.a2aMax)}</td><td class="num">${fmtMs(s.joinMed)}</td>` +
       `<td class="num">${fmt1(s.loss, '%')}</td><td class="num">${fmt1(s.lossP90, '%')}</td><td class="num">${fmt0(s.jitter, ' ms')}</td><td class="num">${fmt0(s.rtt, ' ms')}</td>` +
-      `<td class="num">${fmt0(s.e2e, ' ms')}</td><td class="num">${fmt1(s.gapsPerMin)}</td><td class="num">${fmtMs(s.gapTotal)}</td><td class="num">${s.reconnects}</td>` +
+      `<td class="num">${fmt0(s.e2e, ' ms')}</td><td class="num">${fmt1(s.conceal, '%')}</td><td class="num">${fmt1(s.concealP90, '%')}</td>` +
+      `<td class="num">${s.mos == null ? '–' : s.mos.toFixed(2)}</td><td class="num">${s.mosP10 == null ? '–' : s.mosP10.toFixed(2)}</td>` +
+      `<td class="num">${s.rating == null ? '–' : s.rating.toFixed(1) + `（${s.ratingN}）`}</td><td class="num">${fmt1(s.gapsPerMin)}</td><td class="num">${fmtMs(s.gapTotal)}</td><td class="num">${s.reconnects}</td>` +
       `<td class="num">${fmtMs(s.recovMed)}</td><td class="num">${fmtPct(s.udpShare)}</td><td class="num">${fmtPct(s.relayShare)}</td></tr>`;
   }).join('');
   $('groupTable').innerHTML = gs.length ? head + body : '<tr><td class="empty">沒有符合篩選條件的資料。</td></tr>';
@@ -450,10 +461,10 @@ function markdown() {
     const [setting, scen] = k.split(' | ');
     md += `| ${setting} | ${scen} | ${sa.n} | ${fmtPct(sa.okRate)} | ${fmtMs(sa.a2aMed)} | ${fmtMs(sa.a2aP90)} | ${sb.n} | ${fmtPct(sb.okRate)} | ${fmtMs(sb.a2aMed)} | ${fmtMs(sb.a2aP90)} | ${saved == null ? '–' : fmtMs(saved)} | ${sl ? fmtMs(sl.a2aMed) + '／' + fmtPct(sl.okRate) : '–'} |\n`;
   }
-  md += '\n### 各組指標\n\n| 組別 | 筆數 | 成功率 | 沒出聲 | 加入失敗 | 接聽→出聲 中位 | P90 | 掉包 | RTT | 斷音／分 | UDP 比例 |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n';
+  md += '\n### 各組指標\n\n| 組別 | 筆數 | 成功率 | 沒出聲 | 加入失敗 | 接聽→出聲 中位 | P90 | 掉包 | 隱藏比例 | MOS 估計 | 人工評分 | RTT | 斷音／分 | UDP 比例 |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n';
   for (const [k, list] of lastGroups) {
     const s = stats(list);
-    md += `| ${k.replace(/\|/g, '/')} | ${s.n} | ${fmtPct(s.okRate)} | ${s.noAudio} | ${s.joinFailed} | ${fmtMs(s.a2aMed)} | ${fmtMs(s.a2aP90)} | ${fmt1(s.loss, '%')} | ${fmt0(s.rtt, ' ms')} | ${fmt1(s.gapsPerMin)} | ${fmtPct(s.udpShare)} |\n`;
+    md += `| ${k.replace(/\|/g, '/')} | ${s.n} | ${fmtPct(s.okRate)} | ${s.noAudio} | ${s.joinFailed} | ${fmtMs(s.a2aMed)} | ${fmtMs(s.a2aP90)} | ${fmt1(s.loss, '%')} | ${fmt1(s.conceal, '%')} | ${s.mos == null ? '–' : s.mos.toFixed(2)} | ${s.rating == null ? '–' : s.rating.toFixed(1)} | ${fmt0(s.rtt, ' ms')} | ${fmt1(s.gapsPerMin)} | ${fmtPct(s.udpShare)} |\n`;
   }
   return md;
 }

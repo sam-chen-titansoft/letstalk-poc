@@ -39,6 +39,18 @@ const pct = (a, p) => {
   return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
 };
 const median = a => pct(a, 50);
+const peerTone = rec => !rec || rec.peerSource == null || rec.peerSource === 'tone';
+
+// ITU-T G.107 E-model with Ie=0, Bpl=25. Effective loss is the concealed-audio share when the browser reports it,
+// so loss repaired by FEC/RED does not count. Mouth-to-ear delay ≈ own RTT (assumes the peer's leg is similar) + jitter buffer + 40 ms codec/framing.
+function mosEstimate(lossPct, rttMs, jbMs) {
+  if (lossPct == null || rttMs == null) return null;
+  const d = rttMs + (jbMs || 0) + 40;
+  const id = 0.024 * d + (d > 177.3 ? 0.11 * (d - 177.3) : 0);
+  const ie = 95 * lossPct / (lossPct + 25);
+  const R = Math.max(0, Math.min(100, 93.2 - id - ie));
+  return 1 + 0.035 * R + 7e-6 * R * (R - 60) * (100 - R);
+}
 function safeGet(key, fallback) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch (e) { return fallback; }
 }
@@ -211,13 +223,14 @@ function levelTick() {
   if (!rec.firstAudioAt && canHear && sound) onFirstAudio(t);
 
   // Gap tracking only makes sense with the continuous test tone.
-  if (rec.firstAudioAt && cfg.audioSource === 'tone' && a.gapActive) {
+  if (rec.firstAudioAt && peerTone(rec) && a.gapActive) {
     if (!sound) {
       if (a.silentSince && !a.inGap && t - a.silentSince >= GAP_MIN_MS) a.inGap = true;
     } else if (a.inGap) {
       const ms = t - a.silentSince;
       a.gaps.push({ at: Math.round(a.silentSince - rec._t0), ms: Math.round(ms) });
       logEvt('gap', `${Math.round(ms)} ms`);
+      chartMark('gap');
       a.inGap = false;
     }
   }
@@ -262,7 +275,7 @@ async function sampleTick() {
   if (!S.engine) return;
   let st = null;
   try { st = await collectPcStats(); } catch (e) { /* ignore */ }
-  const s = { lossPct: null, jitterMs: null, rttMs: null, kbps: null, proto: null, ctype: null };
+  const s = { lossPct: null, jitterMs: null, rttMs: null, kbps: null, proto: null, ctype: null, concealPct: null, concealEv: null, jbMs: null, mos: null };
   if (st) {
     const t = now();
     if (st.inbound) {
@@ -274,8 +287,20 @@ async function sampleTick() {
         const dt = (t - S.prevIn.t) / 1000;
         s.lossPct = dRecv + dLost > 0 ? (dLost / (dRecv + dLost)) * 100 : (dRecv === 0 ? null : 0);
         s.kbps = dt > 0 ? (dBytes * 8) / 1000 / dt : null;
+        if (ib.totalSamplesReceived != null && ib.concealedSamples != null) {
+          const dTotal = ib.totalSamplesReceived - S.prevIn.total;
+          const dConc = (ib.concealedSamples - S.prevIn.conc) - ((ib.silentConcealedSamples || 0) - S.prevIn.silentConc);
+          if (dTotal > 0) s.concealPct = Math.max(0, Math.min(100, (dConc / dTotal) * 100));
+          s.concealEv = Math.max(0, (ib.concealmentEvents || 0) - S.prevIn.concEv);
+        }
+        const dEmit = (ib.jitterBufferEmittedCount || 0) - S.prevIn.jbEmit;
+        if (dEmit > 0) s.jbMs = (((ib.jitterBufferDelay || 0) - S.prevIn.jbDelay) / dEmit) * 1000;
       }
-      S.prevIn = { id: ib.id, packetsReceived: ib.packetsReceived || 0, packetsLost: ib.packetsLost || 0, bytesReceived: ib.bytesReceived || 0, t };
+      S.prevIn = {
+        id: ib.id, packetsReceived: ib.packetsReceived || 0, packetsLost: ib.packetsLost || 0, bytesReceived: ib.bytesReceived || 0, t,
+        total: ib.totalSamplesReceived || 0, conc: ib.concealedSamples || 0, silentConc: ib.silentConcealedSamples || 0,
+        concEv: ib.concealmentEvents || 0, jbDelay: ib.jitterBufferDelay || 0, jbEmit: ib.jitterBufferEmittedCount || 0,
+      };
       if (ib.jitter != null) s.jitterMs = ib.jitter * 1000;
     }
     if (st.pair && st.pair.currentRoundTripTime != null) s.rttMs = st.pair.currentRoundTripTime * 1000;
@@ -290,7 +315,9 @@ async function sampleTick() {
   s.e2eMs = ex.e2e != null ? ex.e2e : null;
   s.sdkLossPct = ex.sdkLoss != null ? ex.sdkLoss : null;
   if (s.rttMs != null) S.lastRtt = s.rttMs;
+  s.mos = mosEstimate(s.concealPct != null ? s.concealPct : s.lossPct, s.rttMs, s.jbMs);
   S.live = Object.assign({}, S.live, s);
+  pushSeries(s);
   const rec = S.cur;
   if (rec && rec.samples.length < 3600) {
     rec.samples.push({
@@ -298,17 +325,143 @@ async function sampleTick() {
       loss: s.lossPct == null ? null : +s.lossPct.toFixed(2), jit: s.jitterMs == null ? null : Math.round(s.jitterMs),
       rtt: s.rttMs == null ? null : Math.round(s.rttMs), kbps: s.kbps == null ? null : +s.kbps.toFixed(1),
       e2e: s.e2eMs, proto: s.proto, ctype: s.ctype, lvl: S.aud ? +S.aud.lastLevel.toFixed(3) : null,
+      conc: s.concealPct == null ? null : +s.concealPct.toFixed(2), cev: s.concealEv,
+      jb: s.jbMs == null ? null : Math.round(s.jbMs), mos: s.mos == null ? null : +s.mos.toFixed(2),
     });
   }
 }
 
 function startSampling() {
   if (S.sampling) return;
+  resetSeries();
   S.prevIn = null;
   S.sampling = setInterval(sampleTick, 1000);
 }
 function stopSampling() {
   if (S.sampling) { clearInterval(S.sampling); S.sampling = null; }
+}
+
+// ---------- live charts ----------
+const CHART_WINDOW_S = 120;
+const CHARTS = [
+  { k: 'conc', title: '隱藏音訊比例', unit: '%', min: 0, max: 5, d: 1, ref: { v: 1, label: '1%' },
+    help: '接收端有多少比例的聲音是解碼器「猜」出來補上的：封包掉了，FEC／RED 也救不回來。靜音段不算。\n0–1%：聽不出來\n1–3%：偶爾細微失真\n3–5% 以上：明顯斷續、機器音\n這是最接近「聽起來有沒有壞掉」的指標，比掉包率更準。' },
+  { k: 'mos', title: 'MOS 估計', unit: '', min: 1, max: 4.5, d: 2, fixed: true, ref: { v: 3.5, label: '3.5' },
+    help: '用隱藏比例、RTT 和緩衝延遲，依 ITU-T E-model 推算的 1–5 分，理論上限約 4.4。\n4.0 以上：好\n3.5–4.0：尚可\n3.5 以下：多數人會覺得差\n是估計值，適合比較不同後端、不同網路，不等於真人評分。' },
+  { k: 'loss', title: '掉包率', unit: '%', min: 0, max: 5, d: 1,
+    help: '網路上遺失的封包比例，是 FEC／RED 補救之前的數字。\n掉包高不一定聽得出來，要對照隱藏比例：\n掉包高、隱藏比例低：備援編碼有效，聽不出來\n兩者都高：真的會聽到斷音' },
+  { k: 'rtt', title: 'RTT', unit: ' ms', min: 0, max: 200, d: 0, ref: { v: 300, label: '300 ms' },
+    help: '封包從這台裝置到媒體伺服器的來回時間。對方聽到你的延遲，大約是雙方 RTT 一半相加，再加上緩衝。\n150 ms 以下：無感\n150–300 ms：開始會搶話\n300 ms 以上：對話明顯卡頓\n突然升高通常代表網路擁塞，或正在切換 Wi-Fi／行動網路。' },
+  { k: 'jit', title: '抖動', unit: ' ms', min: 0, max: 40, d: 0,
+    help: '封包到達時間的不穩定程度。抖動越大，接收端要把緩衝拉越長來排隊，延遲就跟著增加。\n20 ms 以下：正常\n30 ms 以上：緩衝變長、延遲增加\n劇烈跳動時，常伴隨隱藏比例上升。' },
+  { k: 'kbps', title: '接收位元率', unit: ' kbps', min: 0, max: 120, d: 0,
+    help: '實際收到的音訊資料量。LiveKit 開了 RED 備援，每個封包夾帶前一包，所以約 80–100 kbps。各後端的編碼設定不同，不要跨後端直接比高低。\n突然掉到 0：聲音中斷\n同一後端持續偏低：頻寬受限，或對方網路差' },
+];
+const CH = { series: [], marks: [], hoverT: null };
+
+function resetSeries() { CH.series = []; CH.marks = []; drawCharts(); }
+function pushSeries(s) {
+  CH.series.push({ t: Date.now(), conc: s.concealPct, mos: s.mos, loss: s.lossPct, rtt: s.rttMs, jit: s.jitterMs, kbps: s.kbps });
+  const cut = Date.now() - CHART_WINDOW_S * 1000;
+  while (CH.series.length && CH.series[0].t < cut) CH.series.shift();
+  while (CH.marks.length && CH.marks[0].t < cut) CH.marks.shift();
+  drawCharts();
+}
+function chartMark(label) { CH.marks.push({ t: Date.now(), label }); }
+
+function initCharts() {
+  const box = $('charts');
+  box.innerHTML = CHARTS.map(c => `<figure class="chart" data-k="${c.k}"><figcaption><span class="ctitle">${c.title}` +
+    `<button type="button" class="info" aria-label="${c.title}怎麼看" aria-describedby="help-${c.k}">?</button></span><b data-cur>-</b></figcaption>` +
+    `<div class="chelp" role="tooltip" id="help-${c.k}">${escapeHtml(c.help).replace(/\n/g, '<br>')}</div>` +
+    `<svg role="img" aria-label="${c.title}，最近 ${CHART_WINDOW_S / 60} 分鐘"></svg><div class="ctip" hidden></div></figure>`).join('');
+  box.querySelectorAll('svg').forEach(svg => {
+    svg.addEventListener('pointermove', e => {
+      const r = svg.getBoundingClientRect();
+      const g = svg._geo;
+      if (!g) return;
+      const x = Math.max(g.x0, Math.min(g.x1, e.clientX - r.left));
+      CH.hoverT = g.t0 + (x - g.x0) / (g.x1 - g.x0) * (g.t1 - g.t0);
+      drawCharts();
+    });
+    svg.addEventListener('pointerleave', () => { CH.hoverT = null; drawCharts(); });
+  });
+  box.querySelectorAll('.info').forEach(b => {
+    b.addEventListener('click', e => {
+      e.stopPropagation();
+      const fig = b.closest('.chart');
+      const open = !fig.classList.contains('help-open');
+      box.querySelectorAll('.chart.help-open').forEach(f => f.classList.remove('help-open'));
+      if (open) fig.classList.add('help-open');
+    });
+  });
+  document.addEventListener('click', () => box.querySelectorAll('.chart.help-open').forEach(f => f.classList.remove('help-open')));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') box.querySelectorAll('.chart.help-open').forEach(f => f.classList.remove('help-open')); });
+  window.addEventListener('resize', drawCharts);
+}
+
+function drawCharts() {
+  const box = $('charts');
+  if (!box || !box.firstChild) return;
+  const t1 = CH.series.length ? Math.max(Date.now(), CH.series[CH.series.length - 1].t) : Date.now();
+  const t0 = t1 - CHART_WINDOW_S * 1000;
+  let hoverRow = null;
+  if (CH.hoverT != null && CH.series.length) {
+    hoverRow = CH.series.reduce((b, p) => Math.abs(p.t - CH.hoverT) < Math.abs(b.t - CH.hoverT) ? p : b, CH.series[0]);
+  }
+  for (const c of CHARTS) {
+    const fig = box.querySelector(`[data-k="${c.k}"]`);
+    const svg = fig.querySelector('svg');
+    const W = Math.max(200, svg.clientWidth || fig.clientWidth);
+    const H = 110, padL = 34, padR = 8, padT = 6, padB = 18;
+    const x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
+    const vals = CH.series.map(p => p[c.k]).filter(v => v != null && !isNaN(v));
+    let lo = c.min, hi = c.max;
+    if (!c.fixed && vals.length) hi = Math.max(c.max, Math.max(...vals) * 1.15);
+    const X = t => x0 + (t - t0) / (t1 - t0) * (x1 - x0);
+    const Y = v => y1 - (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo) * (y1 - y0);
+    const fmt = v => v == null || isNaN(v) ? '-' : Number(v).toFixed(c.d) + c.unit;
+    let h = '';
+    for (const f of [0, 0.5, 1]) {
+      const v = lo + (hi - lo) * f, y = Y(v);
+      h += `<line x1="${x0}" x2="${x1}" y1="${y}" y2="${y}" class="cg"/>`;
+      h += `<text x="${x0 - 4}" y="${y + 3}" text-anchor="end" class="ct">${Number(v.toFixed(c.d === 2 ? 1 : 0))}</text>`;
+    }
+    h += `<text x="${x0}" y="${H - 4}" class="ct">-${CHART_WINDOW_S / 60} 分</text><text x="${x1}" y="${H - 4}" text-anchor="end" class="ct">現在</text>`;
+    if (c.ref && c.ref.v >= lo && c.ref.v <= hi) {
+      const y = Y(c.ref.v);
+      h += `<line x1="${x0}" x2="${x1}" y1="${y}" y2="${y}" class="cref"/><text x="${x1 - 2}" y="${y - 3}" text-anchor="end" class="ct">${c.ref.label}</text>`;
+    }
+    for (const m of CH.marks) {
+      if (m.t < t0) continue;
+      const x = X(m.t);
+      h += `<line x1="${x}" x2="${x}" y1="${y0}" y2="${y1}" class="cmark"/>`;
+    }
+    let d = '', pen = false;
+    for (const p of CH.series) {
+      const v = p[c.k];
+      if (v == null || isNaN(v)) { pen = false; continue; }
+      d += `${pen ? 'L' : 'M'}${X(p.t).toFixed(1)},${Y(v).toFixed(1)}`;
+      pen = true;
+    }
+    if (d) h += `<path d="${d}" class="cl"/>`;
+    const last = [...CH.series].reverse().find(p => p[c.k] != null && !isNaN(p[c.k]));
+    if (last && !hoverRow) h += `<circle cx="${X(last.t)}" cy="${Y(last[c.k])}" r="4" class="cdot"/>`;
+    const tip = fig.querySelector('.ctip');
+    if (hoverRow) {
+      const x = X(hoverRow.t);
+      h += `<line x1="${x}" x2="${x}" y1="${y0}" y2="${y1}" class="cx"/>`;
+      if (hoverRow[c.k] != null) h += `<circle cx="${x}" cy="${Y(hoverRow[c.k])}" r="4" class="cdot"/>`;
+      const ago = Math.round((t1 - hoverRow.t) / 1000);
+      tip.textContent = `${ago} 秒前　${fmt(hoverRow[c.k])}`;
+      tip.hidden = false;
+      tip.style.left = Math.min(Math.max(0, x - 50), W - 110) + 'px';
+    } else tip.hidden = true;
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+    svg.innerHTML = h;
+    svg._geo = { x0, x1, t0, t1 };
+    fig.querySelector('[data-cur]').textContent = fmt(last ? last[c.k] : null);
+  }
 }
 
 // ---------- engine callbacks ----------
@@ -320,7 +473,7 @@ const H = {
     const rec = S.cur;
     if (rec && rec.connTrail.length < 40) rec.connTrail.push(state + (reason ? `(${reason})` : ''));
     if (state === 'RECONNECTING' || state === 'SIGNALRECONNECTING') {
-      if (!S.reconnectStart) S.reconnectStart = now();
+      if (!S.reconnectStart) { S.reconnectStart = now(); chartMark('reconnect'); }
       if (rec) rec.reconnects++;
     } else if (state === 'CONNECTED' && S.reconnectStart) {
       const ms = Math.round(now() - S.reconnectStart);
@@ -349,7 +502,11 @@ const H = {
   },
   message(m) {
     if (!m || !m.t) return;
-    logEvt('msg', m.t + (m.cycle != null ? ' #' + m.cycle : ''));
+    logEvt('msg', m.t + (m.cycle != null ? ' #' + m.cycle : '') + (m.source ? ' source=' + m.source : ''));
+    if (m.t === 'peer' && cfg.role === 'callee') {
+      if (S.cur && S.cur.cycle === m.cycle) S.cur.peerSource = m.source || null;
+      return;
+    }
     if (cfg.role !== 'caller') return;
     if (m.t === 'accept') {
       if (S.cur && S.cur.cycle === m.cycle && !S.cur.result) return; // duplicate accept for the same cycle
@@ -358,6 +515,8 @@ const H = {
       rec.cycle = m.cycle;
       rec.joinMode = m.joinMode || rec.joinMode;
       rec.peerScenario = m.scenario || '';
+      rec.peerSource = m.source || null;
+      S.engine.send({ t: 'peer', cycle: m.cycle, source: cfg.audioSource });
       rec.joinMs = S.session ? S.session.joinMs : null;
       rec.publishMs = S.session ? S.session.publishMs : null;
       const half = (S.lastRtt || 0) / 2;
@@ -581,7 +740,7 @@ function newRecord(role) {
     joinMode: cfg.joinMode, audioSource: cfg.audioSource,
     area: cfg.backend === 'agora' ? (cfg.agoraArea || 'default') : ((S.engine && S.engine.region) || ''),
     proxy: cfg.backend === 'agora' ? String(cfg.agoraProxy) : (cfg.lkRelay === '1' ? 'relay' : '0'),
-    scenario: cfg.scenario, note: cfg.note, device: cfg.device,
+    scenario: cfg.scenario, note: cfg.note, device: cfg.device, peerSource: null, userRating: null,
     ua: navigator.userAgent.slice(0, 160), cycle: null,
     ringAt: null, acceptAt: null, acceptEstimated: false, joinedAt: null, publishedAt: null,
     remoteTrackAt: null, playStartAt: null, firstAudioAt: null,
@@ -598,15 +757,19 @@ function summarize(rec) {
   const nums = k => heard.map(s => s[k]).filter(v => v != null && !isNaN(v));
   const protos = [...new Set(heard.map(s => s.proto).filter(Boolean))].join('|');
   const ctypes = [...new Set(heard.map(s => s.ctype).filter(Boolean))].join('|');
+  const tone = peerTone(rec);
   const gaps = (S.aud && S.cur === rec) ? S.aud.gaps : [];
   const loss = nums('loss');
   const rtt = nums('rtt');
+  const conc = nums('conc');
+  const mos = nums('mos');
   return {
     id: rec.id, startedAt: rec.startedAt, role: rec.role, backend: rec.backend, sdk: rec.sdk,
     joinMode: rec.joinMode, audioSource: rec.audioSource, area: rec.area, proxy: rec.proxy,
     scenario: rec.scenario, peerScenario: rec.peerScenario || '', note: rec.note, device: rec.device, cycle: rec.cycle,
     result: rec.result, error: rec.error,
-    acceptToFirstAudioMs: rec.acceptToFirstAudioMs, acceptEstimated: rec.acceptEstimated,
+    peerSource: rec.peerSource || '', toneMeasured: tone,
+    acceptToFirstAudioMs: tone ? rec.acceptToFirstAudioMs : null, acceptEstimated: rec.acceptEstimated,
     joinMs: rec.joinMs, publishMs: rec.publishMs,
     ringToJoinedMs: rec.ringAt != null && rec.joinedAt != null ? Math.round(rec.joinedAt - rec.ringAt) : null,
     acceptToJoinedMs: rec.acceptAt != null && rec.joinedAt != null ? Math.round(rec.joinedAt - rec.acceptAt) : null,
@@ -619,8 +782,15 @@ function summarize(rec) {
     maxRttMs: rtt.length ? Math.max(...rtt) : null,
     avgE2eMs: avg(nums('e2e')) == null ? null : Math.round(avg(nums('e2e'))),
     avgKbps: avg(nums('kbps')) == null ? null : +avg(nums('kbps')).toFixed(1),
-    gapCount: gaps.length, gapTotalMs: gaps.reduce((s, g) => s + g.ms, 0),
-    longestGapMs: gaps.length ? Math.max(...gaps.map(g => g.ms)) : 0,
+    gapCount: tone ? gaps.length : null, gapTotalMs: tone ? gaps.reduce((s, g) => s + g.ms, 0) : null,
+    longestGapMs: tone ? (gaps.length ? Math.max(...gaps.map(g => g.ms)) : 0) : null,
+    avgConcealPct: avg(conc) == null ? null : +avg(conc).toFixed(2),
+    maxConcealPct: conc.length ? Math.max(...conc) : null,
+    concealEvents: heard.reduce((s, x) => s + (x.cev || 0), 0),
+    avgJbMs: avg(nums('jb')) == null ? null : Math.round(avg(nums('jb'))),
+    mosEst: avg(mos) == null ? null : +avg(mos).toFixed(2),
+    mosP10: mos.length ? pct(mos, 10) : null,
+    userRating: rec.userRating,
     reconnects: rec.reconnects, recoveryMs: rec.recoveryMs.join('|'),
     worstDownQuality: rec.worstDownQuality, protocol: protos, candidateType: ctypes,
     connTrail: rec.connTrail.join('>'),
@@ -652,9 +822,27 @@ function finalize(result, error) {
     S.records.forEach((r, i) => { if (i < S.records.length - 50) { r.samples = []; r.events = []; } });
     if (!safeSet(REC_KEY, S.records)) logEvt('storage_full', '請先匯出再清除紀錄');
   }
-  logEvt('record_saved', `${result} accept→audio=${fmtMs(summary.acceptToFirstAudioMs)}`);
+  logEvt('record_saved', `${result} accept→audio=${fmtMs(summary.acceptToFirstAudioMs)} MOS≈${summary.mosEst == null ? '-' : summary.mosEst}`);
+  if (!(S.loop && S.loop.running)) askRating(full);
   S.cur = null;
   if (S.noAudioTimer) { clearTimeout(S.noAudioTimer); S.noAudioTimer = null; }
+  renderSummary();
+}
+
+function askRating(rec) {
+  const box = $('rateBox');
+  $('rateInfo').textContent = `${rec.startedAt.slice(11, 19)}・${rec.role === 'caller' ? '主叫' : '被叫'}・${rec.result}`;
+  box.dataset.id = rec.id;
+  box.hidden = false;
+}
+function setRating(v) {
+  const box = $('rateBox');
+  const rec = S.records.find(r => r.id === box.dataset.id);
+  box.hidden = true;
+  if (!rec || v == null) return;
+  rec.userRating = v;
+  safeSet(REC_KEY, S.records);
+  logEvt('rated', String(v));
   renderSummary();
 }
 
@@ -757,7 +945,7 @@ async function calleeAccept() {
   S.noAudioTimer = setTimeout(() => {
     if (S.cur === rec && !rec.firstAudioAt) { logEvt('no_audio_timeout', fmtMs(timeoutMs)); calleeHangup('no_audio'); }
   }, timeoutMs);
-  const acceptMsg = () => ({ t: 'accept', cycle: rec.cycle, sinceAcceptMs: Math.round(now() - rec.acceptAt), joinMode: cfg.joinMode, scenario: cfg.scenario });
+  const acceptMsg = () => ({ t: 'accept', cycle: rec.cycle, sinceAcceptMs: Math.round(now() - rec.acceptAt), joinMode: cfg.joinMode, scenario: cfg.scenario, source: cfg.audioSource });
   try {
     if (S.engine.resumeAudio) S.engine.resumeAudio();
     if (cfg.joinMode === 'pre-join') {
@@ -883,7 +1071,7 @@ function renderChips() {
 function renderLive() {
   const s = S.live || {};
   const rec = S.cur;
-  $('mAccept').textContent = rec && rec.acceptToFirstAudioMs != null ? fmtMs(rec.acceptToFirstAudioMs)
+  $('mAccept').textContent = rec && rec.acceptToFirstAudioMs != null ? fmtMs(rec.acceptToFirstAudioMs) + (peerTone(rec) ? '' : '（對方真人聲音，不計）')
     : (rec && rec.acceptAt ? fmtMs(now() - rec.acceptAt) + '…' : '-');
   $('mJoin').textContent = fmtMs(s.join);
   $('mPublish').textContent = fmtMs(s.publish);
@@ -895,7 +1083,9 @@ function renderLive() {
   $('mKbps').textContent = s.kbps == null ? '-' : fmtNum(s.kbps) + ' kbps';
   $('mProto').textContent = s.proto ? `${s.proto} ${s.ctype || ''}` : '-';
   const g = S.aud ? S.aud.gaps : [];
-  $('mGaps').textContent = S.aud ? `${g.length} / ${fmtMs(g.reduce((x, y) => x + y.ms, 0))}` : '-';
+  $('mGaps').textContent = !S.aud ? '-' : (rec && !peerTone(rec)) ? '對方非測試音，不計' : `${g.length} / ${fmtMs(g.reduce((x, y) => x + y.ms, 0))}`;
+  $('mConceal').textContent = s.concealPct == null ? '-' : fmtNum(s.concealPct) + ' %';
+  $('mMos').textContent = s.mos == null ? '-' : fmtNum(s.mos, 2);
   $('mNetq').textContent = s.netq || '-';
 }
 
@@ -907,19 +1097,24 @@ function renderSummary() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
   }
-  const head = '<tr><th>分組（角色 · SDK · 模式 · 區域 · 代理 · 情境）</th><th>筆數</th><th>成功率</th><th>接聽→出聲 中位</th><th>P90</th><th>平均掉包</th><th>平均 RTT</th><th>斷音總長（平均）</th><th>重連</th></tr>';
+  const head = '<tr><th>分組（角色 · SDK · 模式 · 區域 · 代理 · 情境）</th><th>筆數</th><th>成功率</th><th>接聽→出聲 中位</th><th>P90</th><th>平均掉包</th><th>隱藏比例</th><th>MOS 估計</th><th>人工評分</th><th>平均 RTT</th><th>斷音總長（平均）</th><th>重連</th></tr>';
   const rows = [];
   for (const [key, list] of groups) {
     const ok = list.filter(r => r.result === 'ok');
     const a2a = ok.map(r => r.acceptToFirstAudioMs).filter(v => v != null);
     const loss = ok.map(r => r.avgLossPct).filter(v => v != null);
     const rtt = ok.map(r => r.avgRttMs).filter(v => v != null);
-    const gap = ok.map(r => r.gapTotalMs || 0);
+    const gap = ok.filter(r => r.toneMeasured !== false).map(r => r.gapTotalMs || 0);
+    const conc = ok.map(r => r.avgConcealPct).filter(v => v != null);
+    const mos = ok.map(r => r.mosEst).filter(v => v != null);
+    const rate = list.map(r => r.userRating).filter(v => v != null);
     const okRate = list.length ? (ok.length / list.length) * 100 : 0;
     const cls = okRate >= 95 ? 'ok' : okRate >= 85 ? 'warn' : 'bad';
     rows.push(`<tr><td>${escapeHtml(key)}</td><td class="num">${list.length}</td><td class="num ${cls}">${okRate.toFixed(0)}%</td>` +
       `<td class="num">${fmtMs(median(a2a))}</td><td class="num">${fmtMs(pct(a2a, 90))}</td>` +
-      `<td class="num">${loss.length ? avg(loss).toFixed(1) + '%' : '-'}</td><td class="num">${rtt.length ? Math.round(avg(rtt)) + ' ms' : '-'}</td>` +
+      `<td class="num">${loss.length ? avg(loss).toFixed(1) + '%' : '-'}</td><td class="num">${conc.length ? avg(conc).toFixed(1) + '%' : '-'}</td>` +
+      `<td class="num">${mos.length ? avg(mos).toFixed(2) : '-'}</td><td class="num">${rate.length ? avg(rate).toFixed(1) + `（${rate.length}）` : '-'}</td>` +
+      `<td class="num">${rtt.length ? Math.round(avg(rtt)) + ' ms' : '-'}</td>` +
       `<td class="num">${gap.length ? fmtMs(avg(gap)) : '-'}</td><td class="num">${list.reduce((s, r) => s + (r.reconnects || 0), 0)}</td></tr>`);
   }
   $('summary').innerHTML = rows.length ? head + rows.join('') : '<tr><td>還沒有紀錄</td></tr>';
@@ -954,7 +1149,7 @@ function exportName(ext) {
 }
 function exportCsv() {
   if (!S.records.length) return;
-  const cols = Object.keys(S.records[0]).filter(k => !['milestones', 'gaps', 'samples', 'events'].includes(k));
+  const cols = [...new Set(S.records.flatMap(r => Object.keys(r)))].filter(k => !['milestones', 'gaps', 'samples', 'events'].includes(k));
   const esc = v => {
     if (v == null) return '';
     const s = String(v);
@@ -1020,6 +1215,8 @@ async function init() {
   document.addEventListener('pointerdown', () => { if (S.audioCtx && S.audioCtx.state !== 'running') S.audioCtx.resume().catch(() => {}); }, true);
   const tickClock = () => { $('clock').textContent = wallClock(); requestAnimationFrame(tickClock); };
   requestAnimationFrame(tickClock);
+  initCharts();
+  drawCharts();
   setInterval(levelTick, 50);
   setInterval(() => { renderLive(); applyVisibility(); }, 250);
 
@@ -1032,6 +1229,7 @@ async function init() {
     if (S.loop && S.loop.running) { S.loop.running = false; logEvt('loop_stop_requested'); updateButtons(); }
     else { audioCtx(); runLoop(); }
   };
+  document.querySelectorAll('#rateBox [data-v]').forEach(b => { b.onclick = () => setRating(b.dataset.v === 'skip' ? null : Number(b.dataset.v)); });
   $('btnExportCsv').onclick = exportCsv;
   $('btnExportJson').onclick = exportJson;
   $('btnClear').onclick = () => {

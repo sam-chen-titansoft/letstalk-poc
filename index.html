@@ -82,6 +82,31 @@ table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; }
 td.num { font-family: var(--mono); text-align: right; }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 8px; }
+.chart { margin: 0; position: relative; border: 1px solid var(--line); border-radius: 10px; padding: 8px 8px 4px; min-width: 0; }
+.chart figcaption { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; color: var(--muted); }
+.chart .ctitle { display: inline-flex; align-items: center; gap: 6px; }
+.chart .info { min-height: 0; width: 20px; height: 20px; padding: 0; border-radius: 50%; font: 600 12px/1 var(--mono);
+  color: var(--muted); background: var(--chip); border: 1px solid var(--line); cursor: help; }
+.chart .chelp { display: none; position: absolute; z-index: 5; top: 30px; left: 6px; right: 6px; padding: 8px 10px;
+  font-size: 12px; line-height: 1.55; color: var(--text); background: var(--card); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.15); }
+.chart:has(.info:hover) .chelp, .chart:has(.info:focus-visible) .chelp, .chart.help-open .chelp { display: block; }
+.chart figcaption b { font: 600 15px/1.3 var(--mono); color: var(--text); }
+.chart svg { display: block; width: 100%; height: 110px; touch-action: pan-y; }
+.chart .cg { stroke: var(--line); stroke-width: 1; }
+.chart .ct { font: 10px var(--mono); fill: var(--muted); }
+.chart .cref { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; }
+.chart .cmark { stroke: var(--bad); stroke-width: 1; stroke-opacity: .55; }
+.chart .cl { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .cdot { fill: var(--accent); stroke: var(--card); stroke-width: 2; }
+.chart .cx { stroke: var(--muted); stroke-width: 1; }
+.chart .ctip { position: absolute; top: 28px; font: 12px var(--mono); background: var(--card); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; pointer-events: none; white-space: nowrap; }
+.rate { margin-top: 12px; padding: 10px; border: 1px dashed var(--accent); border-radius: 10px; }
+.rate .k { font-size: 13px; color: var(--muted); }
+.rate .k span { margin-left: 8px; font-family: var(--mono); }
+.rate .actions button { flex: 1 1 60px; }
 .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
 </style>
 </head>
@@ -117,6 +142,8 @@ td.num { font-family: var(--mono); text-align: right; }
       <div class="metric"><div class="k">傳輸</div><div class="v" id="mProto">-</div></div>
       <div class="metric"><div class="k">斷音（次／總長）</div><div class="v" id="mGaps">-</div></div>
       <div class="metric"><div class="k">網路品質（上／下）</div><div class="v" id="mNetq">-</div></div>
+      <div class="metric hl"><div class="k">隱藏音訊比例</div><div class="v" id="mConceal">-</div></div>
+      <div class="metric hl"><div class="k">MOS 估計（1–5）</div><div class="v" id="mMos">-</div></div>
     </div>
     <div class="meter" title="對方音量"><div id="levelBar"></div></div>
 
@@ -133,6 +160,19 @@ td.num { font-family: var(--mono); text-align: right; }
       <button id="btnLoop">開始自動循環</button>
     </div>
     <p class="hint" id="roleHint"></p>
+    <div id="rateBox" class="rate" hidden>
+      <div class="k">剛才這通聽起來如何？<span id="rateInfo"></span></div>
+      <div class="actions">
+        <button data-v="1">1 很差</button><button data-v="2">2 差</button><button data-v="3">3 普通</button>
+        <button data-v="4">4 好</button><button data-v="5">5 很好</button><button data-v="skip">略過</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>即時圖表（最近 2 分鐘）</h2>
+    <div id="charts" class="charts"></div>
+    <p class="hint">每秒更新一次。灰色虛線是參考門檻（隱藏比例 1%、MOS 3.5、RTT 300 ms），紅色細線標出斷音或重連的時間點。滑過任一張圖，所有圖會同步顯示同一時間的數值。點標題旁的「?」看這張圖怎麼解讀。</p>
   </section>
 
   <section class="card">
@@ -214,6 +254,8 @@ td.num { font-family: var(--mono); text-align: right; }
     <div class="table-wrap"><table id="summary"></table></div>
     <p class="hint"><a href="report.html" target="_blank" rel="noopener">開啟報表工具</a>：把多支手機匯出的檔案合併比較。</p>
     <p class="hint">「接聽 → 聽到聲音」：被叫是從按下接聽算起；主叫是用對方送來的接聽訊息往回推算（扣掉 RTT 的一半），屬估計值。</p>
+    <p class="hint">「接聽 → 聽到聲音」和「斷音」只在對方送測試音時才計算；對方是真人聲音時，講話的停頓會被誤判，所以不計。</p>
+    <p class="hint">「隱藏音訊比例」：接收端有多少比例的聲音是解碼器補出來的（已扣掉靜音段），FEC／RED 成功補回的封包不算。「MOS 估計」：用隱藏比例、RTT 和緩衝延遲，依 ITU-T E-model 推算，只能互相比較，不等於真人評分。</p>
   </section>
 
   <section class="card">
